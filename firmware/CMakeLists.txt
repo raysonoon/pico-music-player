@@ -60,3 +60,8 @@ target_link_libraries(pico-music-player
 
 pico_add_extra_outputs(pico-music-player)
 
+if (PICO_CYW43_SUPPORTED)
+    target_link_libraries(pico-music-player pico_cyw43_arch_none)
+endif()
+
+
