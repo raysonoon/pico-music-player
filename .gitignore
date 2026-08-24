@@ -3,3 +3,4 @@ build
 TODO.md
 .env
 .cache
+__pycache__
