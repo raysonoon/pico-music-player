@@ -1,53 +1,69 @@
-/**
- * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
- *
- * SPDX-License-Identifier: BSD-3-Clause
- */
-
+#include <stdio.h>
 #include "pico/stdlib.h"
 
-// Pico W devices use a GPIO on the WIFI chip for the LED,
-// so when building for Pico W, CYW43_WL_GPIO_LED_PIN will be defined
-#ifdef CYW43_WL_GPIO_LED_PIN
-#include "pico/cyw43_arch.h"
-#endif
+// Push button on GPIO15 (active-low: pressed reads 0)
+#define BUTTON_PIN            15
+#define DEBOUNCE_MS           25
+#define LONG_PRESS_MS         1000
+#define MULTI_TAP_WINDOW_MS   300
 
-#ifndef LED_DELAY_MS
-#define LED_DELAY_MS 250
-#endif
-
-// Perform initialisation
-int pico_led_init(void) {
-#if defined(PICO_DEFAULT_LED_PIN)
-    // A device like Pico that uses a GPIO for the LED will define PICO_DEFAULT_LED_PIN
-    // so we can use normal GPIO functionality to turn the led on and off
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-    return PICO_OK;
-#elif defined(CYW43_WL_GPIO_LED_PIN)
-    // For Pico W devices we need to initialise the driver etc
-    return cyw43_arch_init();
-#endif
-}
-
-// Turn the led on or off
-void pico_set_led(bool led_on) {
-#if defined(PICO_DEFAULT_LED_PIN)
-    // Just set the GPIO on or off
-    gpio_put(PICO_DEFAULT_LED_PIN, led_on);
-#elif defined(CYW43_WL_GPIO_LED_PIN)
-    // Ask the wifi "driver" to set the GPIO on or off
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
-#endif
+static void dispatch_gesture(int taps) {
+    switch (taps) {
+        case 1:  printf("gesture: play/pause\n");               break;
+        case 2:  printf("gesture: next track\n");               break;
+        case 3:  printf("gesture: restart / previous track\n"); break;
+        case 4:  printf("gesture: minimalist mode\n");          break;
+        case 5:  printf("gesture: party mode\n");               break;
+        default: printf("calm down\n");                         break;
+    }
 }
 
 int main() {
-    int rc = pico_led_init();
-    hard_assert(rc == PICO_OK);
+    stdio_init_all();
+
+    gpio_init(BUTTON_PIN);
+    gpio_set_dir(BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(BUTTON_PIN);
+
+    printf("pico-music-player started\n");
+
+    bool button_pressed = false;
+    absolute_time_t debounce_until = 0;
+    absolute_time_t press_start;
+    bool long_press_fired = false;
+    int tap_count = 0;
+    absolute_time_t multi_tap_deadline;
+
     while (true) {
-        pico_set_led(true);
-        sleep_ms(LED_DELAY_MS);
-        pico_set_led(false);
-        sleep_ms(LED_DELAY_MS);
+        bool pressed = !gpio_get(BUTTON_PIN); // inverts the active-low reading i.e. true if pressed, false if released
+
+        if (pressed != button_pressed && time_reached(debounce_until)) {
+            button_pressed = pressed;
+            debounce_until = make_timeout_time_ms(DEBOUNCE_MS);
+
+            if (pressed) {
+                press_start = get_absolute_time();
+                long_press_fired = false;
+            } else {
+                if (!long_press_fired) {
+                    tap_count++;
+                    multi_tap_deadline = make_timeout_time_ms(MULTI_TAP_WINDOW_MS);
+                }
+            }
+        }
+
+        if (button_pressed && !long_press_fired &&
+            absolute_time_diff_us(press_start, get_absolute_time()) >= LONG_PRESS_MS * 1000) {
+            long_press_fired = true;
+            tap_count = 0;
+            printf("gesture: add track to favourites\n");
+        }
+
+        if (tap_count > 0 && time_reached(multi_tap_deadline)) {
+            dispatch_gesture(tap_count);
+            tap_count = 0;
+        }
+
+        sleep_ms(10);
     }
 }
