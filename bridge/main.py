@@ -16,7 +16,7 @@ CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 
-# Permissions needed to control playback, read song info, and save tracks
+# Permissions needed to control playback, read song info and save tracks
 SCOPE = "user-modify-playback-state user-read-playback-state user-library-modify"
 
 # Initialize Spotipy's SpotifyOAuth manager
