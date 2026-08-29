@@ -33,9 +33,17 @@ project(pico-music-player C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+# Add library subdirectories
+add_subdirectory(lib/Config)
+add_subdirectory(lib/OLED)
+add_subdirectory(lib/GUI)
+add_subdirectory(lib/Fonts)
+
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(pico-music-player pico-music-player.c )
+add_executable(pico-music-player
+        pico-music-player.c
+)
 
 pico_set_program_name(pico-music-player "pico-music-player")
 pico_set_program_version(pico-music-player "0.1")
@@ -46,17 +54,21 @@ pico_enable_stdio_usb(pico-music-player 1)
 
 # Add the standard library to the build
 target_link_libraries(pico-music-player
-        pico_stdlib)
+        pico_stdlib
+        Config
+        OLED
+        GUI
+        Fonts
+)
 
 # Add the standard include files to the build
 target_include_directories(pico-music-player PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
+        lib/Config
+        lib/OLED
+        lib/GUI
+        lib/Fonts
 )
-
-# Add any user requested libraries
-target_link_libraries(pico-music-player 
-        
-        )
 
 pico_add_extra_outputs(pico-music-player)
 
