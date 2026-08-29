@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
@@ -9,6 +10,9 @@
 #include "lwip/ip4_addr.h"
 
 #include "network_config.h"
+
+#include "OLED_1in3_c.h"
+#include "GUI_Paint.h"
 
 // Push button on GPIO15 (active-low: pressed reads 0)
 #define BUTTON_PIN            15
@@ -21,10 +25,35 @@ typedef struct http_state {
     ip_addr_t remote_addr;
     const char *request;
     size_t request_len;
-    bool done;
-    bool ok;
+    volatile bool done;
+    volatile bool ok;
     absolute_time_t deadline;
+    char response[64];
+    size_t response_len;
 } http_state_t;
+
+static UBYTE *oled_image;
+
+static void oled_init(void) {
+    DEV_Module_Init();
+    OLED_1in3_C_Init();
+    OLED_1in3_C_Clear();
+
+    UWORD size = ((OLED_1in3_C_WIDTH % 8 == 0) ? (OLED_1in3_C_WIDTH / 8)
+                                               : (OLED_1in3_C_WIDTH / 8 + 1))
+               * OLED_1in3_C_HEIGHT;
+    oled_image = (UBYTE *)malloc(size);
+    Paint_NewImage(oled_image, OLED_1in3_C_WIDTH, OLED_1in3_C_HEIGHT, 0, WHITE);
+    Paint_Clear(BLACK);
+    OLED_1in3_C_Display(oled_image);
+}
+
+static void oled_show_text(const char *line1, const char *line2) {
+    Paint_Clear(BLACK);
+    Paint_DrawString_EN(0, 6,  line1, &Font16, WHITE, BLACK);
+    Paint_DrawString_EN(0, 36, line2, &Font12, WHITE, BLACK);
+    OLED_1in3_C_Display(oled_image);
+}
 
 static err_t http_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
     http_state_t *s = (http_state_t *)arg;
@@ -44,6 +73,16 @@ static err_t http_connected(void *arg, struct tcp_pcb *pcb, err_t err) {
     return ERR_OK;
 }
 
+static bool http_status_ok(const char *response, size_t len) {
+    const char *sp = memchr(response, ' ', len);
+    if (!sp) return false;
+    size_t off = (size_t)(sp - response);
+    if (off + 4 > len) return false;   // need " 200" (space + 3 digits)
+    char code[4] = {response[off + 1], response[off + 2], response[off + 3], '\0'};
+    int status = atoi(code);
+    return status >= 200 && status < 300;
+}
+
 static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     http_state_t *s = (http_state_t *)arg;
     if (err != ERR_OK) {
@@ -52,11 +91,18 @@ static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err
         return ERR_OK;
     }
     if (p == NULL) {
-        // Server closed the connection after its response.
-        s->ok = true;
+        // Connection closed; evaluate the HTTP status code we received.
+        s->ok = http_status_ok(s->response, s->response_len);
         s->done = true;
         tcp_close(pcb);
         return ERR_OK;
+    }
+    if (s->response_len < sizeof(s->response) - 1) {
+        size_t avail = sizeof(s->response) - 1 - s->response_len;
+        size_t n = (p->tot_len < avail) ? p->tot_len : avail;
+        pbuf_copy_partial(p, s->response + s->response_len, n, 0);
+        s->response_len += n;
+        s->response[s->response_len] = '\0';
     }
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
@@ -133,25 +179,31 @@ static bool send_action(const char *command) {
 
 static void dispatch_gesture(int taps) {
     const char *command = NULL;
+    const char *label = NULL;
     switch (taps) {
-        case 1:  command = "play-pause";          break;
-        case 2:  command = "next";                break;
-        case 3:  command = "previous-or-restart"; break;
-        case 4:  command = "minimalist";          break;
-        case 5:  command = "party";               break;
-        default: printf("calm down\n");           return;
+        case 1:  command = "play-pause";          label = "Play/Pause"; break;
+        case 2:  command = "next";                label = "Next";       break;
+        case 3:  command = "previous-or-restart"; label = "Previous";   break;
+        case 4:  command = "minimalist";          label = "Minimalist"; break;
+        case 5:  command = "party";               label = "Party";      break;
+        default:
+            oled_show_text("calm down", "");
+            return;
     }
-    printf("gesture: %d taps -> %s\n", taps, command);
-    send_action(command);
+    oled_show_text(label, "");
+    if (!send_action(command)) oled_show_text(label, "Failed");
 }
 
 static void long_press(void) {
-    printf("gesture: add track to favourites -> favourite\n");
-    send_action("favourite");
+    oled_show_text("Favourite", "");
+    if (!send_action("favourite")) oled_show_text("Favourite", "Failed");
 }
 
 int main() {
     stdio_init_all();
+
+    oled_init();
+    oled_show_text("Pico Music", "Player");
 
     if (cyw43_arch_init()) {
         printf("error: cyw43 init failed\n");
