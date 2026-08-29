@@ -8,13 +8,16 @@ load_dotenv()
 
 app = FastAPI(title="Spotify Hardware Remote Bridge")
 
+# In-memory mode state (set by gestures)
+current_mode = "default"
+
 # Spotify API Credentials
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 
-# Permissions needed to control playback and read song info
-SCOPE = "user-modify-playback-state user-read-playback-state"
+# Permissions needed to control playback, read song info, and save tracks
+SCOPE = "user-modify-playback-state user-read-playback-state user-library-modify"
 
 # Initialize Spotipy's SpotifyOAuth manager
 # cache_path='.cache' saves refresh tokens locally so you only log in once
@@ -62,8 +65,10 @@ def callback(code: str):
 def handle_action(command: str):
     """
     Endpoint called by your Pico W or test tools.
-    Commands supported: play, pause, next, previous, restart
+    Commands supported: play, pause, next, previous, restart,
+                        previous-or-restart, minimalist, party, favourite
     """
+    global current_mode
     sp = get_spotify_client()
     
     try:
@@ -85,6 +90,27 @@ def handle_action(command: str):
         elif command == "restart":
             # Restart current track (seek to 0ms)
             sp.seek_track(position_ms=0)
+        elif command == "previous-or-restart":
+            # Restart current track if it's been playing >= 3s, otherwise skip to previous
+            playback = sp.current_playback()
+            if playback and playback.get("progress_ms", 0) >= 3000:
+                sp.seek_track(position_ms=0)
+            else:
+                sp.previous_track()
+        elif command == "minimalist":
+            # Toggle minimalist mode
+            current_mode = "default" if current_mode == "minimalist" else "minimalist"
+        elif command == "party":
+            # Enable party mode and shuffle playback
+            current_mode = "party"
+            sp.shuffle(True)
+        elif command == "favourite":
+            # Save the currently playing track to Liked Songs
+            track = sp.current_user_playing_track()
+            if track and track.get("item"):
+                sp.current_user_saved_tracks_add(tracks=[track["item"]["id"]])
+            else:
+                raise HTTPException(status_code=400, detail="Nothing currently playing.")
         else:
             raise HTTPException(status_code=400, detail="Invalid action command.")
             
@@ -111,3 +137,9 @@ def get_current_track():
         return {"is_playing": False, "title": "Nothing Playing", "artist": "N/A"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mode")
+def get_current_mode():
+    """Returns the current bridge mode (e.g. 'default', 'minimalist', 'party')."""
+    return {"mode": current_mode}
