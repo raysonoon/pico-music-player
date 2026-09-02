@@ -2,14 +2,28 @@ from fastapi import FastAPI, HTTPException
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 import os
+import threading
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Spotify Hardware Remote Bridge")
+POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1"))
 
 # In-memory mode state (set by gestures)
 current_mode = "default"
+
+# Cached playback snapshot, refreshed by a background poller thread.
+_snapshot = {
+    "is_playing": False,
+    "title": "Nothing Playing",
+    "artist": "N/A",
+    "album": "",
+    "progress_ms": 0,
+    "duration_ms": 0,
+    "progress_percent": 0,
+}
+_snapshot_lock = threading.Lock()
 
 # Spotify API Credentials
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
@@ -28,6 +42,58 @@ sp_oauth = SpotifyOAuth(
     scope=SCOPE,
     cache_path=".cache"
 )
+
+
+def _poll_playback(stop_event):
+    """Background thread: poll Spotify playback state and cache the latest snapshot."""
+    sp = Spotify(auth_manager=sp_oauth)
+    while not stop_event.is_set():
+        try:
+            playback = sp.current_playback()
+            if playback and playback.get("item"):
+                item = playback["item"]
+                artists = item.get("artists") or []
+                artist = ", ".join(a["name"] for a in artists if a.get("name"))
+                duration_ms = item.get("duration_ms", 0) or 0
+                progress_ms = playback.get("progress_ms", 0) or 0
+                progress_percent = round(progress_ms * 100 / duration_ms) if duration_ms else 0
+                snap = {
+                    "is_playing": bool(playback.get("is_playing")),
+                    "title": item.get("name", "Unknown"),
+                    "artist": artist or "N/A",
+                    "album": (item.get("album") or {}).get("name", ""),
+                    "progress_ms": progress_ms,
+                    "duration_ms": duration_ms,
+                    "progress_percent": progress_percent,
+                }
+            else:
+                snap = {
+                    "is_playing": False,
+                    "title": "Nothing Playing",
+                    "artist": "N/A",
+                    "album": "",
+                    "progress_ms": 0,
+                    "duration_ms": 0,
+                    "progress_percent": 0,
+                }
+            with _snapshot_lock:
+                _snapshot.update(snap)
+        except Exception:
+            pass
+        stop_event.wait(POLL_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    stop_event = threading.Event()
+    thread = threading.Thread(target=_poll_playback, args=(stop_event,), daemon=True)
+    thread.start()
+    yield
+    stop_event.set()
+
+
+app = FastAPI(title="Spotify Hardware Remote Bridge", lifespan=lifespan)
+
 
 def get_spotify_client():
     """Helper to retrieve an authenticated Spotipy client, auto-refreshing tokens if expired."""
@@ -121,22 +187,9 @@ def handle_action(command: str):
 
 @app.get("/track")
 def get_current_track():
-    """Returns currently playing track title and artist for your OLED display."""
-    sp = get_spotify_client()
-    try:
-        track = sp.current_user_playing_track()
-        if track and track.get("item"):
-            item = track["item"]
-            title = item["name"]
-            artist = item["artists"][0]["name"]
-            return {
-                "is_playing": track["is_playing"],
-                "title": title,
-                "artist": artist
-            }
-        return {"is_playing": False, "title": "Nothing Playing", "artist": "N/A"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Returns the cached playback snapshot refreshed by the background poller."""
+    with _snapshot_lock:
+        return dict(_snapshot)
 
 
 @app.get("/mode")
