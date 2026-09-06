@@ -4,6 +4,7 @@ from spotipy.oauth2 import SpotifyOAuth
 import os
 import threading
 from contextlib import asynccontextmanager
+from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,6 +13,13 @@ POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1"))
 
 # In-memory mode state (set by gestures)
 current_mode = "default"
+
+# OLED text layout (must match the firmware constants)
+FRAME_WIDTH = 128
+TITLE_H = 13
+ARTIST_H = 13
+ALBUM_H = 12
+TITLE_X_OFFSET = 13  # leaves room for the play/pause glyph
 
 # Cached playback snapshot, refreshed by a background poller thread.
 _snapshot = {
@@ -22,6 +30,9 @@ _snapshot = {
     "progress_ms": 0,
     "duration_ms": 0,
     "progress_percent": 0,
+    "title_bmp": "00" * (FRAME_WIDTH * TITLE_H // 8),
+    "artist_bmp": "00" * (FRAME_WIDTH * ARTIST_H // 8),
+    "album_bmp": "00" * (FRAME_WIDTH * ALBUM_H // 8),
 }
 _snapshot_lock = threading.Lock()
 
@@ -42,6 +53,53 @@ sp_oauth = SpotifyOAuth(
     scope=SCOPE,
     cache_path=".cache"
 )
+
+
+def _load_font(size):
+    """Load a CJK-capable TTF, falling back to Pillow's default bitmap font."""
+    candidates = [os.getenv("FONT_PATH")] + [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            try:
+                return ImageFont.truetype(c, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+_font9 = _load_font(9)
+_font8 = _load_font(8)
+
+
+def _render_line(text, height, font, x_offset=0):
+    """Render a single text line to a 1-bit bitmap, hex-encoded for the Pico."""
+    img = Image.new("1", (FRAME_WIDTH, height), 0)
+    d = ImageDraw.Draw(img)
+    t = text or ""
+    avail = FRAME_WIDTH - x_offset
+    if d.textlength(t, font=font) > avail:
+        ell = "..."
+        while t and d.textlength(t + ell, font=font) > avail:
+            t = t[:-1]
+        t = t + ell
+    d.text((x_offset, 0), t, font=font, fill=1)
+    return img.tobytes().hex()
+
+
+def _render_bitmaps(snap):
+    """Attach the three rendered text lines (hex bitmaps) to a snapshot."""
+    try:
+        snap["title_bmp"] = _render_line(snap["title"], TITLE_H, _font9, TITLE_X_OFFSET)
+        snap["artist_bmp"] = _render_line(snap["artist"], ARTIST_H, _font9, 0)
+        snap["album_bmp"] = _render_line(snap["album"], ALBUM_H, _font8, 0)
+    except Exception:
+        snap["title_bmp"] = "00" * (FRAME_WIDTH * TITLE_H // 8)
+        snap["artist_bmp"] = "00" * (FRAME_WIDTH * ARTIST_H // 8)
+        snap["album_bmp"] = "00" * (FRAME_WIDTH * ALBUM_H // 8)
 
 
 def _poll_playback(stop_event):
@@ -76,6 +134,7 @@ def _poll_playback(stop_event):
                     "duration_ms": 0,
                     "progress_percent": 0,
                 }
+            _render_bitmaps(snap)
             with _snapshot_lock:
                 _snapshot.update(snap)
         except Exception:

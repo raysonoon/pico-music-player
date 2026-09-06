@@ -2,3 +2,4 @@ fastapi
 spotipy
 uvicorn
 python-dotenv
+pillow
