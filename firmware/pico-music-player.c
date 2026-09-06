@@ -18,7 +18,8 @@
 #define BUTTON_PIN            15
 #define DEBOUNCE_MS           25
 #define LONG_PRESS_MS         1000
-#define MULTI_TAP_WINDOW_MS   500
+#define MULTI_TAP_WINDOW_MS   700
+#define FEEDBACK_HOLD_MS      1500
 
 // Now-playing poll + display layout
 #define POLL_INTERVAL_MS      1000
@@ -70,6 +71,12 @@ typedef struct {
 } track_snapshot_t;
 
 static UBYTE *oled_image;
+
+static absolute_time_t feedback_until;
+
+static void hold_feedback(void) {
+    feedback_until = make_timeout_time_ms(FEEDBACK_HOLD_MS);
+}
 
 static void oled_init(void) {
     DEV_Module_Init();
@@ -302,10 +309,18 @@ static bool http_request(const char *method, const char *path,
     return true;
 }
 
-static bool send_action(const char *command) {
+static bool json_str_field(const char *json, const char *key, char *out, size_t out_cap);
+
+static bool send_action(const char *command, char *result, size_t result_cap) {
     char path[64];
     snprintf(path, sizeof(path), "/action/%s", command);
-    return http_request("POST", path, NULL, 0);
+    char body[256];
+    if (!http_request("POST", path, body, sizeof(body))) return false;
+    if (result && result_cap > 0) {
+        result[0] = '\0';
+        json_str_field(body, "result", result, result_cap);
+    }
+    return true;
 }
 
 static const char *json_find(const char *json, const char *key) {
@@ -331,6 +346,16 @@ static long json_int_field(const char *json, const char *key) {
     const char *p = json_find(json, key);
     if (!p) return 0;
     return strtol(p, NULL, 10);
+}
+
+static bool json_str_field(const char *json, const char *key, char *out, size_t out_cap) {
+    const char *p = json_find(json, key);
+    if (!p || *p != '"') return false;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n < out_cap - 1) out[n++] = *p++;
+    out[n] = '\0';
+    return n > 0;
 }
 
 static int hexval(char c) {
@@ -427,24 +452,33 @@ static void poll_track(void) {
 
 static void dispatch_gesture(int taps) {
     const char *command = NULL;
-    const char *label = NULL;
+    const char *fallback = NULL;
     switch (taps) {
-        case 1:  command = "play-pause";          label = "Play/Pause"; break;
-        case 2:  command = "next";                label = "Next";       break;
-        case 3:  command = "previous-or-restart"; label = "Previous";   break;
-        case 4:  command = "minimalist";          label = "Minimalist"; break;
-        case 5:  command = "party";               label = "Party";      break;
+        case 1:  command = "play-pause";          fallback = "Play/Pause"; break;
+        case 2:  command = "next";                fallback = "Next";       break;
+        case 3:  command = "previous-or-restart"; fallback = "Previous";   break;
+        case 4:  command = "minimalist";          fallback = "Minimalist"; break;
+        case 5:  command = "party";               fallback = "Party";      break;
         default:
             oled_show_text("calm down", "");
+            hold_feedback();
             return;
     }
-    oled_show_text(label, "");
-    if (!send_action(command)) oled_show_text(label, "Failed");
+    char result[32];
+    if (send_action(command, result, sizeof(result)) && result[0])
+        oled_show_text(result, "");
+    else
+        oled_show_text(fallback, "Failed");
+    hold_feedback();
 }
 
 static void long_press(void) {
+    hold_feedback();
     animate_heart();
-    if (!send_action("favourite")) oled_show_text("Favourite", "Failed");
+    if (!send_action("favourite", NULL, 0)) {
+        oled_show_text("Favourite", "Failed");
+        hold_feedback();
+    }
 }
 
 int main() {
@@ -512,7 +546,9 @@ int main() {
 
         if (time_reached(next_poll)) {
             next_poll = make_timeout_time_ms(POLL_INTERVAL_MS);
-            poll_track();
+            if (time_reached(feedback_until)) {
+                poll_track();
+            }
         }
 
         sleep_ms(10);
