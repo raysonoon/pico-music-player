@@ -22,22 +22,31 @@
 
 // Now-playing poll + display layout
 #define POLL_INTERVAL_MS      1000
-#define HTTP_RESPONSE_MAX     1024
+#define HTTP_RESPONSE_MAX     3072
 #define FIELD_MAX             64
+
+// Text bitmap line sizes (must match the bridge rendering)
+#define BMP_ROW_BYTES         16   // 128 px / 8
+#define TITLE_H               13
+#define ARTIST_H              13
+#define ALBUM_H               12
+#define TITLE_BMP_BYTES       (BMP_ROW_BYTES * TITLE_H)
+#define ARTIST_BMP_BYTES      (BMP_ROW_BYTES * ARTIST_H)
+#define ALBUM_BMP_BYTES       (BMP_ROW_BYTES * ALBUM_H)
 
 #define ICON_X                2
 #define ICON_Y                1
-#define TITLE_X               13
 #define TITLE_Y               0
-#define ARTIST_Y              14
-#define ALBUM_Y               28
-#define BAR_Y                 39
+#define ARTIST_Y              13
+#define ALBUM_Y               26
+#define BAR_Y                 38
 #define BAR_H                 6
-#define TIME_Y                47
+#define TIME_Y                44
 
-#define TITLE_MAX             16
-#define ARTIST_MAX            18
-#define ALBUM_MAX             25
+// Heart (Favourite) animation layout
+#define HEART_CY              30
+#define HEART_OFFSET          32
+#define HEART_TIP             5
 
 typedef struct http_state {
     struct tcp_pcb *pcb;
@@ -53,11 +62,11 @@ typedef struct http_state {
 
 typedef struct {
     bool is_playing;
-    char title[FIELD_MAX];
-    char artist[FIELD_MAX];
-    char album[FIELD_MAX];
     long progress_ms;
     long duration_ms;
+    UBYTE title_bmp[TITLE_BMP_BYTES];
+    UBYTE artist_bmp[ARTIST_BMP_BYTES];
+    UBYTE album_bmp[ALBUM_BMP_BYTES];
 } track_snapshot_t;
 
 static UBYTE *oled_image;
@@ -83,27 +92,6 @@ static void oled_show_text(const char *line1, const char *line2) {
     OLED_1in3_C_Display(oled_image);
 }
 
-static void sanitize_and_truncate(const char *src, char *dst, size_t max_chars) {
-    char tmp[FIELD_MAX];
-    size_t i = 0;
-    while (*src && i < sizeof(tmp) - 1) {
-        unsigned char c = (unsigned char)*src;
-        tmp[i++] = (c >= 0x20 && c <= 0x7e) ? (char)c : ' ';
-        src++;
-    }
-    tmp[i] = '\0';
-
-    if (i <= max_chars) {
-        strcpy(dst, tmp);
-        return;
-    }
-    memcpy(dst, tmp, max_chars - 3);
-    dst[max_chars - 3] = '.';
-    dst[max_chars - 2] = '.';
-    dst[max_chars - 1] = '.';
-    dst[max_chars] = '\0';
-}
-
 static void fmt_time(long ms, char *buf, size_t bufsz) {
     long s = ms / 1000;
     if (s < 0) s = 0;
@@ -117,8 +105,8 @@ static void draw_play(int x0, int y0) {
     for (int r = 0; r < h; r++) {
         int t = r - half;
         if (t < 0) t = -t;
-        int left = x0 + (t * w) / half;
-        Paint_DrawLine((UWORD)left, (UWORD)(y0 + r), (UWORD)(x0 + w), (UWORD)(y0 + r),
+        int right = x0 + w - (t * w) / half;
+        Paint_DrawLine((UWORD)x0, (UWORD)(y0 + r), (UWORD)right, (UWORD)(y0 + r),
                        WHITE, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
     }
 }
@@ -126,6 +114,38 @@ static void draw_play(int x0, int y0) {
 static void draw_pause(int x0, int y0) {
     Paint_DrawRectangle(x0, y0, x0 + 2, y0 + 10, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
     Paint_DrawRectangle(x0 + 5, y0, x0 + 7, y0 + 10, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+}
+
+static void draw_heart(int cx, int cy, int scale) {
+    for (int dy = -scale * 2; dy <= scale * 2; dy++) {
+        float Y = -(float)dy / scale;
+        for (int dx = -scale * 3; dx <= scale * 3; dx++) {
+            float X = (float)dx / scale;
+            float ypow = Y;
+            for (int i = 1; i < HEART_TIP; i++) ypow *= Y;
+            float t = X * X + Y * Y - 1.0f;
+            if (t * t * t - X * X * ypow <= 0.0f) {
+                int px = cx + dx, py = cy + dy;
+                if (px >= 0 && px < 128 && py >= 0 && py < 64)
+                    Paint_DrawPoint(px, py, WHITE, DOT_PIXEL_1X1, DOT_FILL_AROUND);
+            }
+        }
+    }
+}
+
+static void draw_hearts(int scale) {
+    draw_heart(64 - HEART_OFFSET, HEART_CY, scale);
+    draw_heart(64 + HEART_OFFSET, HEART_CY, scale);
+}
+
+static void animate_heart(void) {
+    static const int scales[] = { 8, 13, 10, 14, 11, 13 }; // ba-bum pulse
+    for (size_t i = 0; i < sizeof(scales) / sizeof(scales[0]); i++) {
+        Paint_Clear(BLACK);
+        draw_hearts(scales[i]);
+        OLED_1in3_C_Display(oled_image);
+        sleep_ms(110);
+    }
 }
 
 static void draw_progress_bar(int percent) {
@@ -313,42 +333,54 @@ static long json_int_field(const char *json, const char *key) {
     return strtol(p, NULL, 10);
 }
 
-static void json_str_field(const char *json, const char *key, char *out, size_t outsz) {
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void json_hex_field(const char *json, const char *key, UBYTE *out, size_t out_bytes) {
     const char *p = json_find(json, key);
     if (!p || *p != '"') {
-        out[0] = '\0';
+        memset(out, 0, out_bytes);
         return;
     }
     p++;
     size_t n = 0;
-    while (*p && *p != '"' && n < outsz - 1) {
-        if (*p == '\\' && *(p + 1) == '"') {
-            out[n++] = '"';
-            p += 2;
-        } else if (*p == '\\' && *(p + 1) == '\\') {
-            out[n++] = '\\';
+    while (*p && *p != '"' && n < out_bytes) {
+        int hi = hexval(*p);
+        int lo = *(p + 1) ? hexval(*(p + 1)) : -1;
+        if (hi >= 0 && lo >= 0) {
+            out[n++] = (UBYTE)((hi << 4) | lo);
             p += 2;
         } else {
-            out[n++] = *p++;
+            p++;
         }
     }
-    out[n] = '\0';
+    while (n < out_bytes) out[n++] = 0;
 }
 
 static bool parse_track(const char *body, track_snapshot_t *t) {
     if (!body || !body[0]) return false;
     t->is_playing = json_bool_field(body, "is_playing");
-    json_str_field(body, "title", t->title, sizeof(t->title));
-    json_str_field(body, "artist", t->artist, sizeof(t->artist));
-    json_str_field(body, "album", t->album, sizeof(t->album));
     t->progress_ms = json_int_field(body, "progress_ms");
     t->duration_ms = json_int_field(body, "duration_ms");
+    json_hex_field(body, "title_bmp", t->title_bmp, TITLE_BMP_BYTES);
+    json_hex_field(body, "artist_bmp", t->artist_bmp, ARTIST_BMP_BYTES);
+    json_hex_field(body, "album_bmp", t->album_bmp, ALBUM_BMP_BYTES);
     return true;
 }
 
-static void render_track(const track_snapshot_t *t) {
-    char line[FIELD_MAX];
+static void blit_bitmap(const UBYTE *bmp, int y0, int h) {
+    for (int r = 0; r < h; r++) {
+        for (int i = 0; i < BMP_ROW_BYTES; i++) {
+            oled_image[(y0 + r) * BMP_ROW_BYTES + i] |= bmp[r * BMP_ROW_BYTES + i];
+        }
+    }
+}
 
+static void render_track(const track_snapshot_t *t) {
     Paint_Clear(BLACK);
 
     if (t->is_playing) {
@@ -357,14 +389,9 @@ static void render_track(const track_snapshot_t *t) {
         draw_pause(ICON_X, ICON_Y);
     }
 
-    sanitize_and_truncate(t->title, line, TITLE_MAX);
-    Paint_DrawString_EN(TITLE_X, TITLE_Y, line, &Font12, WHITE, BLACK);
-
-    sanitize_and_truncate(t->artist, line, ARTIST_MAX);
-    Paint_DrawString_EN(0, ARTIST_Y, line, &Font12, WHITE, BLACK);
-
-    sanitize_and_truncate(t->album, line, ALBUM_MAX);
-    Paint_DrawString_EN(0, ALBUM_Y, line, &Font8, WHITE, BLACK);
+    blit_bitmap(t->title_bmp, TITLE_Y, TITLE_H);
+    blit_bitmap(t->artist_bmp, ARTIST_Y, ARTIST_H);
+    blit_bitmap(t->album_bmp, ALBUM_Y, ALBUM_H);
 
     int percent = 0;
     if (t->duration_ms > 0) {
@@ -416,7 +443,7 @@ static void dispatch_gesture(int taps) {
 }
 
 static void long_press(void) {
-    oled_show_text("Favourite", "");
+    animate_heart();
     if (!send_action("favourite")) oled_show_text("Favourite", "Failed");
 }
 
