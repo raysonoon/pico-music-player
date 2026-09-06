@@ -165,6 +165,14 @@ def get_spotify_client():
     return Spotify(auth=token_info["access_token"])
 
 
+def _safe_shuffle(sp, state):
+    """Best-effort shuffle toggle; some playlists/contexts disallow shuffle."""
+    try:
+        sp.shuffle(state)
+    except Exception:
+        pass
+
+
 @app.get("/")
 def read_root():
     return {"status": "Spotify Bridge is Running"}
@@ -195,51 +203,75 @@ def handle_action(command: str):
     """
     global current_mode
     sp = get_spotify_client()
+    result = ""
     
     try:
         if command == "play":
             sp.start_playback()
+            result = "Play"
         elif command == "pause":
             sp.pause_playback()
+            result = "Pause"
         elif command == "play-pause":
             # Toggle play/pause state dynamically
             playback = sp.current_playback()
             if playback and playback.get("is_playing"):
                 sp.pause_playback()
+                result = "Pause"
             else:
                 sp.start_playback()
+                result = "Play"
         elif command == "next":
             sp.next_track()
+            result = "Next"
         elif command == "previous":
             sp.previous_track()
+            result = "Previous"
         elif command == "restart":
             # Restart current track (seek to 0ms)
             sp.seek_track(position_ms=0)
+            result = "Restart"
         elif command == "previous-or-restart":
-            # Restart current track if it's been playing >= 3s, otherwise skip to previous
+            # Restart current track if it's been playing >= 4s, otherwise skip to previous
             playback = sp.current_playback()
-            if playback and playback.get("progress_ms", 0) >= 3000:
+            if playback and playback.get("progress_ms", 0) >= 10000:
                 sp.seek_track(position_ms=0)
+                result = "Restart"
             else:
                 sp.previous_track()
+                result = "Previous"
         elif command == "minimalist":
-            # Toggle minimalist mode
-            current_mode = "default" if current_mode == "minimalist" else "minimalist"
+            # Toggle minimalist mode (single mode at a time)
+            if current_mode == "minimalist":
+                current_mode = "default"
+                result = "Minimalist off"
+            else:
+                if current_mode == "party":
+                    _safe_shuffle(sp, False)  # party's side effect off
+                current_mode = "minimalist"
+                result = "Minimalist on"
         elif command == "party":
-            # Enable party mode and shuffle playback
-            current_mode = "party"
-            sp.shuffle(True)
+            # Toggle party mode and shuffle playback (single mode at a time)
+            if current_mode == "party":
+                current_mode = "default"
+                _safe_shuffle(sp, False)
+                result = "Party off"
+            else:
+                current_mode = "party"
+                _safe_shuffle(sp, True)
+                result = "Party on"
         elif command == "favourite":
             # Save the currently playing track to Liked Songs
             track = sp.current_user_playing_track()
             if track and track.get("item"):
                 sp.current_user_saved_tracks_add(tracks=[track["item"]["id"]])
+                result = "Favourite"
             else:
                 raise HTTPException(status_code=400, detail="Nothing currently playing.")
         else:
             raise HTTPException(status_code=400, detail="Invalid action command.")
             
-        return {"status": "success", "executed_command": command}
+        return {"status": "success", "executed_command": command, "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
