@@ -415,7 +415,7 @@ static void poll_track(void) {
     track_snapshot_t snap;
 
     if (!http_request("GET", "/track", body, sizeof(body))) {
-        oled_show_text("Bridge offline", "");
+        oled_show_text("Bridge", "offline");
         return;
     }
     if (!parse_track(body, &snap)) {
@@ -451,7 +451,7 @@ int main() {
     stdio_init_all();
 
     oled_init();
-    oled_show_text("Pico Music", "Player");
+    oled_show_text("Pico", "Music Player");
 
     if (cyw43_arch_init()) {
         printf("error: cyw43 init failed\n");
