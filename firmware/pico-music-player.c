@@ -22,7 +22,9 @@
 #define FEEDBACK_HOLD_MS      1500
 
 // Now-playing poll + display layout
-#define POLL_INTERVAL_MS      1000
+#define POLL_DEFAULT_MS       1000
+#define POLL_IDLE_MS          3000
+#define END_THRESHOLD_MS      3000
 #define HTTP_RESPONSE_MAX     3072
 #define FIELD_MAX             64
 
@@ -31,9 +33,13 @@
 #define TITLE_H               13
 #define ARTIST_H              13
 #define ALBUM_H               12
-#define TITLE_BMP_BYTES       (BMP_ROW_BYTES * TITLE_H)
-#define ARTIST_BMP_BYTES      (BMP_ROW_BYTES * ARTIST_H)
-#define ALBUM_BMP_BYTES       (BMP_ROW_BYTES * ALBUM_H)
+// Buffers are sized to the larger minimalist heights so they fit both modes
+#define TITLE_BUF_H           21
+#define ARTIST_BUF_H          15
+#define ALBUM_BUF_H           15
+#define TITLE_BMP_BYTES       (BMP_ROW_BYTES * TITLE_BUF_H)
+#define ARTIST_BMP_BYTES      (BMP_ROW_BYTES * ARTIST_BUF_H)
+#define ALBUM_BMP_BYTES       (BMP_ROW_BYTES * ALBUM_BUF_H)
 
 #define ICON_X                2
 #define ICON_Y                1
@@ -43,6 +49,16 @@
 #define BAR_Y                 38
 #define BAR_H                 6
 #define TIME_Y                44
+
+// Minimalist mode layout (must match the bridge rendering)
+#define MINI_TITLE_H          TITLE_BUF_H
+#define MINI_ARTIST_H         ARTIST_BUF_H
+#define MINI_ALBUM_H          ALBUM_BUF_H
+#define MINI_GLYPH_X          2
+#define MINI_GLYPH_Y          11
+#define MINI_TITLE_Y          6
+#define MINI_ARTIST_Y         27
+#define MINI_ALBUM_Y          42
 
 // Heart (Favourite) animation layout
 #define HEART_CY              30
@@ -72,10 +88,15 @@ typedef struct {
     bool is_playing;
     long progress_ms;
     long duration_ms;
+    long remaining_ms;
+    char mode[12];
     UBYTE title_bmp[TITLE_BMP_BYTES];
     UBYTE artist_bmp[ARTIST_BMP_BYTES];
     UBYTE album_bmp[ALBUM_BMP_BYTES];
 } track_snapshot_t;
+
+static int last_remaining_ms = 0;
+static bool last_minimalist = false;
 
 static UBYTE *oled_image;
 
@@ -420,9 +441,19 @@ static bool parse_track(const char *body, track_snapshot_t *t) {
     t->is_playing = json_bool_field(body, "is_playing");
     t->progress_ms = json_int_field(body, "progress_ms");
     t->duration_ms = json_int_field(body, "duration_ms");
-    json_hex_field(body, "title_bmp", t->title_bmp, TITLE_BMP_BYTES);
-    json_hex_field(body, "artist_bmp", t->artist_bmp, ARTIST_BMP_BYTES);
-    json_hex_field(body, "album_bmp", t->album_bmp, ALBUM_BMP_BYTES);
+    t->remaining_ms = json_int_field(body, "remaining_ms");
+    json_str_field(body, "mode", t->mode, sizeof(t->mode));
+    if (!t->mode[0]) strcpy(t->mode, "default");
+
+    if (strcmp(t->mode, "minimalist") == 0) {
+        json_hex_field(body, "title_bmp", t->title_bmp, BMP_ROW_BYTES * MINI_TITLE_H);
+        json_hex_field(body, "artist_bmp", t->artist_bmp, BMP_ROW_BYTES * MINI_ARTIST_H);
+        json_hex_field(body, "album_bmp", t->album_bmp, BMP_ROW_BYTES * MINI_ALBUM_H);
+    } else {
+        json_hex_field(body, "title_bmp", t->title_bmp, BMP_ROW_BYTES * TITLE_H);
+        json_hex_field(body, "artist_bmp", t->artist_bmp, BMP_ROW_BYTES * ARTIST_H);
+        json_hex_field(body, "album_bmp", t->album_bmp, BMP_ROW_BYTES * ALBUM_H);
+    }
     return true;
 }
 
@@ -436,6 +467,19 @@ static void blit_bitmap(const UBYTE *bmp, int y0, int h) {
 
 static void render_track(const track_snapshot_t *t) {
     Paint_Clear(BLACK);
+
+    if (strcmp(t->mode, "minimalist") == 0) {
+        if (t->is_playing) {
+            draw_play(MINI_GLYPH_X, MINI_GLYPH_Y);
+        } else if (t->duration_ms > 0) {
+            draw_pause(MINI_GLYPH_X, MINI_GLYPH_Y);
+        }
+        blit_bitmap(t->title_bmp, MINI_TITLE_Y, MINI_TITLE_H);
+        blit_bitmap(t->artist_bmp, MINI_ARTIST_Y, MINI_ARTIST_H);
+        blit_bitmap(t->album_bmp, MINI_ALBUM_Y, MINI_ALBUM_H);
+        OLED_1in3_C_Display(oled_image);
+        return;
+    }
 
     if (t->is_playing) {
         draw_play(ICON_X, ICON_Y);
@@ -476,6 +520,8 @@ static void poll_track(void) {
         oled_show_text("Bad response", "");
         return;
     }
+    last_minimalist = (strcmp(snap.mode, "minimalist") == 0);
+    last_remaining_ms = (int)snap.remaining_ms;
     render_track(&snap);
 }
 
@@ -575,7 +621,10 @@ int main() {
         }
 
         if (time_reached(next_poll)) {
-            next_poll = make_timeout_time_ms(POLL_INTERVAL_MS);
+            int interval = POLL_DEFAULT_MS;
+            if (last_minimalist && !(last_remaining_ms > 0 && last_remaining_ms <= END_THRESHOLD_MS))
+                interval = POLL_IDLE_MS;
+            next_poll = make_timeout_time_ms(interval);
             if (tap_count == 0 && time_reached(feedback_until)) {
                 poll_track();
             }

@@ -21,6 +21,12 @@ ARTIST_H = 13
 ALBUM_H = 12
 TITLE_X_OFFSET = 13  # leaves room for the play/pause glyph
 
+# Minimalist mode layout (must match the firmware constants)
+MINI_TITLE_H = 21
+MINI_ARTIST_H = 15
+MINI_ALBUM_H = 15
+MINI_GLYPH_COL = 15  # leaves room for the status glyph
+
 # Cached playback snapshot, refreshed by a background poller thread.
 _snapshot = {
     "is_playing": False,
@@ -33,6 +39,8 @@ _snapshot = {
     "title_bmp": "00" * (FRAME_WIDTH * TITLE_H // 8),
     "artist_bmp": "00" * (FRAME_WIDTH * ARTIST_H // 8),
     "album_bmp": "00" * (FRAME_WIDTH * ALBUM_H // 8),
+    "mode": "default",
+    "remaining_ms": 0,
 }
 _snapshot_lock = threading.Lock()
 
@@ -73,6 +81,8 @@ def _load_font(size):
 
 _font9 = _load_font(9)
 _font8 = _load_font(8)
+_font14 = _load_font(14)
+_font10 = _load_font(10)
 
 
 def _render_line(text, height, font, x_offset=0):
@@ -86,16 +96,22 @@ def _render_line(text, height, font, x_offset=0):
         while t and d.textlength(t + ell, font=font) > avail:
             t = t[:-1]
         t = t + ell
-    d.text((x_offset, 0), t, font=font, fill=1)
+    d.text((x_offset, 0), t, font=font, fill=1, anchor="la")
     return img.tobytes().hex()
 
 
 def _render_bitmaps(snap):
     """Attach the three rendered text lines (hex bitmaps) to a snapshot."""
     try:
-        snap["title_bmp"] = _render_line(snap["title"], TITLE_H, _font9, TITLE_X_OFFSET)
-        snap["artist_bmp"] = _render_line(snap["artist"], ARTIST_H, _font9, 0)
-        snap["album_bmp"] = _render_line(snap["album"], ALBUM_H, _font8, 0)
+        mode = snap.get("mode", "default")
+        if mode == "minimalist":
+            snap["title_bmp"] = _render_line(snap["title"], MINI_TITLE_H, _font14, MINI_GLYPH_COL)
+            snap["artist_bmp"] = _render_line(snap["artist"], MINI_ARTIST_H, _font10, 0)
+            snap["album_bmp"] = _render_line(snap["album"], MINI_ALBUM_H, _font10, 0)
+        else:
+            snap["title_bmp"] = _render_line(snap["title"], TITLE_H, _font9, TITLE_X_OFFSET)
+            snap["artist_bmp"] = _render_line(snap["artist"], ARTIST_H, _font9, 0)
+            snap["album_bmp"] = _render_line(snap["album"], ALBUM_H, _font8, 0)
     except Exception:
         snap["title_bmp"] = "00" * (FRAME_WIDTH * TITLE_H // 8)
         snap["artist_bmp"] = "00" * (FRAME_WIDTH * ARTIST_H // 8)
@@ -115,6 +131,7 @@ def _poll_playback(stop_event):
                 duration_ms = item.get("duration_ms", 0) or 0
                 progress_ms = playback.get("progress_ms", 0) or 0
                 progress_percent = round(progress_ms * 100 / duration_ms) if duration_ms else 0
+                remaining_ms = max(duration_ms - progress_ms, 0) if duration_ms else 0
                 snap = {
                     "is_playing": bool(playback.get("is_playing")),
                     "title": item.get("name", "Unknown"),
@@ -123,6 +140,8 @@ def _poll_playback(stop_event):
                     "progress_ms": progress_ms,
                     "duration_ms": duration_ms,
                     "progress_percent": progress_percent,
+                    "remaining_ms": remaining_ms,
+                    "mode": current_mode,
                 }
             else:
                 snap = {
@@ -133,6 +152,8 @@ def _poll_playback(stop_event):
                     "progress_ms": 0,
                     "duration_ms": 0,
                     "progress_percent": 0,
+                    "remaining_ms": 0,
+                    "mode": current_mode,
                 }
             _render_bitmaps(snap)
             with _snapshot_lock:
