@@ -185,13 +185,32 @@ static void draw_smile(int cx, int cy, int span, int rise) {
     }
 }
 
+static void draw_squiggle(int cx, int cy, int span) {
+    const int amp = 4;
+    const int hw  = 8;
+    int half = span / 2;
+    for (int i = 0; i <= span; i++) {
+        int x = i - half;
+        int h = i / hw;
+        int p = i % hw;
+        int t = p * 2 - (hw - 1);
+        int v = amp - (amp * t * t) / ((hw - 1) * (hw - 1));
+        int y = (h % 2 == 0) ? (cy - v) : (cy + v);
+        Paint_DrawPoint(cx + x, y, WHITE, DOT_PIXEL_1X1, DOT_FILL_AROUND);
+    }
+}
+
 static void render_eyes(int taps) {
     static const int rise[] = { 0, 2, 4, 7, 10 };
-    int r = (taps >= 1 && taps <= 5) ? rise[taps - 1] : 0;
     Paint_Clear(BLACK);
     draw_eye(64 - EYE_OFFSET, EYE_Y, EYE_R);
     draw_eye(64 + EYE_OFFSET, EYE_Y, EYE_R);
-    draw_smile(64, SMILE_Y, SMILE_SPAN, r);
+    if (taps >= 6) {
+        draw_squiggle(64, SMILE_Y, SMILE_SPAN);
+    } else {
+        int r = (taps >= 1 && taps <= 5) ? rise[taps - 1] : 0;
+        draw_smile(64, SMILE_Y, SMILE_SPAN, r);
+    }
     OLED_1in3_C_Display(oled_image);
 }
 
