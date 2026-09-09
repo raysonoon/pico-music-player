@@ -46,8 +46,15 @@
 
 // Heart (Favourite) animation layout
 #define HEART_CY              30
-#define HEART_OFFSET          32
+#define HEART_OFFSET          26
 #define HEART_TIP             5
+
+// Tap-count eyes layout
+#define EYE_Y                 24
+#define EYE_OFFSET            26
+#define EYE_R                 13
+#define SMILE_Y               52
+#define SMILE_SPAN            40
 
 typedef struct http_state {
     struct tcp_pcb *pcb;
@@ -143,6 +150,28 @@ static void draw_heart(int cx, int cy, int scale) {
 static void draw_hearts(int scale) {
     draw_heart(64 - HEART_OFFSET, HEART_CY, scale);
     draw_heart(64 + HEART_OFFSET, HEART_CY, scale);
+}
+
+static void draw_eye(int cx, int cy, int r) {
+    Paint_DrawCircle(cx, cy, r, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+}
+
+static void draw_smile(int cx, int cy, int span, int rise) {
+    int half = span / 2;
+    for (int x = -half; x <= half; x++) {
+        int y = cy - (x * x * rise + half * half / 2) / (half * half);
+        Paint_DrawPoint(cx + x, y, WHITE, DOT_PIXEL_1X1, DOT_FILL_AROUND);
+    }
+}
+
+static void render_eyes(int taps) {
+    static const int rise[] = { 0, 2, 4, 7, 10 };
+    int r = (taps >= 1 && taps <= 5) ? rise[taps - 1] : 0;
+    Paint_Clear(BLACK);
+    draw_eye(64 - EYE_OFFSET, EYE_Y, EYE_R);
+    draw_eye(64 + EYE_OFFSET, EYE_Y, EYE_R);
+    draw_smile(64, SMILE_Y, SMILE_SPAN, r);
+    OLED_1in3_C_Display(oled_image);
 }
 
 static void animate_heart(void) {
@@ -528,6 +557,7 @@ int main() {
                 if (!long_press_fired) {
                     tap_count++;
                     multi_tap_deadline = make_timeout_time_ms(MULTI_TAP_WINDOW_MS);
+                    render_eyes(tap_count);
                 }
             }
         }
@@ -546,7 +576,7 @@ int main() {
 
         if (time_reached(next_poll)) {
             next_poll = make_timeout_time_ms(POLL_INTERVAL_MS);
-            if (time_reached(feedback_until)) {
+            if (tap_count == 0 && time_reached(feedback_until)) {
                 poll_track();
             }
         }
