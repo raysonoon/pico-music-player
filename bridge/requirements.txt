@@ -3,3 +3,4 @@ spotipy
 uvicorn
 python-dotenv
 pillow
+requests
