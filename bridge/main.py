@@ -2,9 +2,11 @@ from fastapi import FastAPI, HTTPException
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 import os
+import io
 import threading
 from contextlib import asynccontextmanager
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,6 +15,49 @@ POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1"))
 
 # In-memory mode state (set by gestures)
 current_mode = "default"
+
+# Party mode: album art + tempo sync
+ART_SIZE = 40
+DEFAULT_BPM = 120.0
+RECCOBEATS_BASE = "https://api.reccobeats.com"
+_tempo_cache = {}  # track_id -> tempo (BPM float)
+_art_cache = {}    # image_url -> hex art_bmp string
+
+# Find-a-song: per-band seed tracks (Spotify track IDs) and feature steering.
+# Seed the recommendation on the matching band's genre + the currently playing
+# track; a higher featureWeight lets the tap-derived tempo/features dominate.
+BAND_SEEDS = {
+    # 0-80 BPM: ambient, lofi, acoustic, jazz
+    "ambient": [
+        "1vgSaC0BPlL6LEm4Xsx59J",  # Brian Eno - An Ending (Ascent)
+        "7o2AeQZzfCERsRmOM86EcB",  # Aphex Twin - Xtal
+    ],
+    # 80-115 BPM: indie rock, r&b, city pop, slow pop
+    "indie": [
+        "3lq6i23fC6j1v1AR0GeNg8",  # Mariya Takeuchi - Plastic Love
+        "3rq5w4bQGigXOfdN30ATJt",  # Arctic Monkeys - Do I Wanna Know?
+    ],
+    # 115-140 BPM: midwest emo, funk, alt rock, upbeat pop
+    "altrock": [
+        "6kZqCqD1r08sJAQ1TjuEpM",  # American Football - Never Meant
+        "69kOkLUCkxIZYexIgSG8rq",  # Daft Punk - Get Lucky
+    ],
+    # >140 BPM: edm, j-rock, punk, metal
+    "metal": [
+        "2DlHlPMa4M17kufBvI2lEN",  # System Of A Down - Chop Suey!
+        "5cW3DEWYYv0tXZMwcUZNRg",  # Metallica - Master Of Puppets
+    ],
+}
+FEATURE_WEIGHT = 2.0   # undocumented scale; tunable, verified against live API
+SPEECHINESS_CAP = 0.35  # reject candidates with more spoken word than this
+
+# BPM bands -> label + audio-feature targets (seed = band genre + current track).
+BANDS = [
+    (80,   "Ambient", dict(energy=0.25, acousticness=0.75, danceability=0.30, instrumentalness=0.55, valence=0.40)),
+    (115,  "Indie",   dict(energy=0.50, acousticness=0.40, danceability=0.60, instrumentalness=0.10, valence=0.60)),
+    (140,  "Alt Rock", dict(energy=0.75, acousticness=0.15, danceability=0.65, instrumentalness=0.05, valence=0.60)),
+    (1e9,  "Metal",   dict(energy=0.90, acousticness=0.05, danceability=0.55, instrumentalness=0.15, valence=0.50)),
+]
 
 # OLED text layout (must match the firmware constants)
 FRAME_WIDTH = 128
@@ -41,6 +86,8 @@ _snapshot = {
     "album_bmp": "00" * (FRAME_WIDTH * ALBUM_H // 8),
     "mode": "default",
     "remaining_ms": 0,
+    "tempo": 0.0,
+    "art_bmp": "",
 }
 _snapshot_lock = threading.Lock()
 
@@ -120,12 +167,17 @@ def _render_bitmaps(snap):
 
 def _poll_playback(stop_event):
     """Background thread: poll Spotify playback state and cache the latest snapshot."""
-    sp = Spotify(auth_manager=sp_oauth)
+    sp = Spotify(auth_manager=sp_oauth, requests_timeout=10)
     while not stop_event.is_set():
         try:
             playback = sp.current_playback()
+            track_id = None
+            art_url = ""
             if playback and playback.get("item"):
                 item = playback["item"]
+                track_id = item.get("id")
+                images = ((item.get("album") or {}).get("images")) or []
+                art_url = images[0]["url"] if images else ""
                 artists = item.get("artists") or []
                 artist = ", ".join(a["name"] for a in artists if a.get("name"))
                 duration_ms = item.get("duration_ms", 0) or 0
@@ -155,6 +207,9 @@ def _poll_playback(stop_event):
                     "remaining_ms": 0,
                     "mode": current_mode,
                 }
+            snap["tempo"] = _get_tempo(track_id) if track_id else 0.0
+            snap["art_url"] = art_url
+            snap["art_bmp"] = _render_album_art(art_url) if art_url else ""
             _render_bitmaps(snap)
             with _snapshot_lock:
                 _snapshot.update(snap)
@@ -183,7 +238,7 @@ def get_spotify_client():
             status_code=401, 
             detail="User not authenticated. Please visit /login in your browser."
         )
-    return Spotify(auth=token_info["access_token"])
+    return Spotify(auth=token_info["access_token"], requests_timeout=10)
 
 
 def _safe_shuffle(sp, state):
@@ -192,6 +247,157 @@ def _safe_shuffle(sp, state):
         sp.shuffle(state)
     except Exception:
         pass
+
+
+def _get_tempo(track_id):
+    """Fetch tempo (BPM) for a Spotify track via ReccoBeats. Returns 0.0 on failure."""
+    if track_id in _tempo_cache:
+        return _tempo_cache[track_id]
+    tempo = 0.0
+    try:
+        r = requests.get(f"{RECCOBEATS_BASE}/v1/track", params={"ids": track_id}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        tracks = data.get("content") if isinstance(data, dict) else data
+        if isinstance(tracks, list) and tracks:
+            rec_id = tracks[0].get("id")
+            if rec_id:
+                af = requests.get(f"{RECCOBEATS_BASE}/v1/track/{rec_id}/audio-features", timeout=5)
+                af.raise_for_status()
+                tempo = float((af.json().get("tempo") or 0.0))
+    except Exception:
+        tempo = 0.0
+    _tempo_cache[track_id] = tempo
+    return tempo
+
+
+def _band_for_bpm(bpm):
+    """Return (label, feature_targets) for a tap tempo."""
+    for limit, label, features in BANDS:
+        if bpm < limit:
+            return label, features
+    return BANDS[-1][1], BANDS[-1][2]
+
+
+def _spotify_id_from_href(href):
+    """Extract a Spotify track id from a reccobeats href, else None.
+
+    Handles both 'https://open.spotify.com/track/{id}' and
+    'https://api.spotify.com/v1/tracks/{id}' URL forms.
+    """
+    if not href:
+        return None
+    parts = [p for p in href.rstrip("/").split("/") if p]
+    for seg in ("track", "tracks"):
+        if seg in parts:
+            i = parts.index(seg)
+            if i + 1 < len(parts):
+                return parts[i + 1]
+    return parts[-1] if parts else None
+
+
+def _find_song(sp, bpm):
+    """Recommend and play a track matching the tapped tempo.
+
+    Seeds the reccobeats recommendation on the band's genre tracks plus the
+    currently playing track, steers with audio-feature targets, hard-filters
+    out spoken-word (speechiness) candidates, then plays the first match.
+    Returns the band label on success.
+    """
+    # Require active playback: the recommendation is queued after the current
+    # track and skipped to, so something must be playing.
+    playback = sp.current_playback()
+    item = (playback or {}).get("item") or {}
+    if not item:
+        raise HTTPException(status_code=400, detail="Nothing playing - open Spotify")
+    current_id = item.get("id") if item.get("type") == "track" else None
+
+    label, features = _band_for_bpm(bpm)
+    print(f"[find-song] bpm={bpm} band={label}", flush=True)
+    seeds = list(BAND_SEEDS.get(label.lower().replace(" ", ""), []))
+    if current_id:
+        seeds.append(current_id)
+    print(f"[find-song] seeds={seeds}", flush=True)
+    if not seeds:
+        raise HTTPException(status_code=400, detail="No seed track")
+
+    params = {
+        "seeds": ",".join(seeds),
+        "size": 20,
+        "tempo": bpm,
+        "speechiness": 0.30,
+        "featureWeight": FEATURE_WEIGHT,
+    }
+    params.update(features)
+    r = requests.get(f"{RECCOBEATS_BASE}/v1/track/recommendation", params=params, timeout=4)
+    r.raise_for_status()
+    tracks = (r.json().get("content") or []) if isinstance(r.json(), dict) else []
+    print(f"[find-song] recommendation returned {len(tracks)} tracks", flush=True)
+    if not tracks:
+        raise HTTPException(status_code=400, detail="No match")
+
+    # Hard-filter speechiness in one batch call using reccobeats UUIDs.
+    ids = [t.get("id") for t in tracks if t.get("id")]
+    speechy = {}
+    try:
+        af = requests.get(f"{RECCOBEATS_BASE}/v1/audio-features",
+                          params={"ids": ",".join(ids)}, timeout=4)
+        af.raise_for_status()
+        for feat in (af.json().get("content") or []):
+            if feat.get("id") in ids:
+                speechy[feat["id"]] = float(feat.get("speechiness") or 0.0)
+    except Exception:
+        pass  # if the batch lookup fails, skip the hard filter
+
+    queued = None
+    for t in tracks:
+        tid = t.get("id")
+        if tid in speechy and speechy[tid] > SPEECHINESS_CAP:
+            print(f"[find-song] skip (speechy) id={tid} title={t.get('trackTitle')}", flush=True)
+            continue
+        sid = _spotify_id_from_href(t.get("href"))
+        if not sid:
+            print(f"[find-song] no id in href id={tid} title={t.get('trackTitle')}", flush=True)
+            continue
+        uri = f"spotify:track:{sid}"
+        print(f"[find-song] queue id={tid} title={t.get('trackTitle')} uri={uri} "
+              f"speechiness={speechy.get(tid)}", flush=True)
+        try:
+            sp.add_to_queue(uri)
+            queued = uri
+            break
+        except Exception as e:
+            print(f"[find-song] add_to_queue failed {uri}: {e}", flush=True)
+            continue
+    if not queued:
+        raise HTTPException(status_code=400, detail="Could not queue any recommendation")
+
+    try:
+        sp.next_track()
+        print(f"[find-song] skipped to queued track", flush=True)
+    except Exception as e:
+        print(f"[find-song] next_track failed: {e}", flush=True)
+    return label
+
+
+def _render_album_art(url):
+    """Download album art and render to a 40x40 1-bit bitmap, hex-encoded."""
+    if url in _art_cache:
+        return _art_cache[url]
+    art = ""
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("L")
+        img = img.resize((ART_SIZE, ART_SIZE), Image.Resampling.LANCZOS)
+        # Soften before binarizing to reduce harsh dither speckle.
+        img = img.filter(ImageFilter.GaussianBlur(radius=1))
+        img = img.convert("1", dither=Image.Dither.NONE)
+        art = img.tobytes().hex()
+    except Exception:
+        art = ""
+    _art_cache[url] = art
+    return art
 
 
 @app.get("/")
@@ -216,18 +422,23 @@ def callback(code: str):
 
 
 @app.post("/action/{command}")
-def handle_action(command: str):
+def handle_action(command: str, bpm: int = 0):
     """
     Endpoint called by your Pico W or test tools.
     Commands supported: play, pause, next, previous, restart,
-                        previous-or-restart, minimalist, party, favourite
+                        previous-or-restart, minimalist, party, favourite,
+                        find-song (expects bpm query param)
     """
     global current_mode
     sp = get_spotify_client()
     result = ""
-    
+
     try:
-        if command == "play":
+        if command == "find-song":
+            if not bpm:
+                raise HTTPException(status_code=400, detail="bpm required")
+            result = _find_song(sp, bpm)
+        elif command == "play":
             sp.start_playback()
             result = "Play"
         elif command == "pause":
@@ -304,7 +515,21 @@ def get_current_track():
         return dict(_snapshot)
 
 
+@app.get("/art")
+def get_art():
+    """Returns the album art bitmap (hex) for the current track."""
+    with _snapshot_lock:
+        return {"art_bmp": _snapshot.get("art_bmp", "")}
+
+
 @app.get("/mode")
 def get_current_mode():
     """Returns the current bridge mode (e.g. 'default', 'minimalist', 'party')."""
     return {"mode": current_mode}
+
+
+@app.get("/debug/devices")
+def debug_devices():
+    """Returns the current Spotify devices for debugging."""
+    sp = get_spotify_client()
+    return {"devices": sp.devices().get("devices") or []}

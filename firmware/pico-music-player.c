@@ -21,6 +21,15 @@
 #define MULTI_TAP_WINDOW_MS   700
 #define FEEDBACK_HOLD_MS      1500
 
+// Find-a-song tempo capture mode
+#define FIND_ARM_TAPS         6       // 6+ taps arms find-a-song mode
+#define FIND_WINDOW_MS        5000    // tempo capture window after first tap
+#define FIND_MIN_TAPS         3       // minimum taps to compute a tempo
+#define FIND_MAX_TAPS         16      // capture buffer size
+#define FIND_IDLE_MS          5000    // auto-exit if mode entered but never tapped
+#define TAP_BPM_MIN           40
+#define TAP_BPM_MAX           250
+
 // Now-playing poll + display layout
 #define POLL_DEFAULT_MS       1000
 #define POLL_IDLE_MS          3000
@@ -72,6 +81,21 @@
 #define SMILE_Y               52
 #define SMILE_SPAN            40
 
+// Party mode: album art + tempo-synced border
+#define ART_W                 40
+#define ART_H                 40
+#define ART_BYTES             (ART_W * ART_H / 8)
+#define ART_X                 ((128 - ART_W) / 2)
+#define ART_Y                 24
+#define DEFAULT_BPM           120.0f
+#define BPM_MIN               40.0f
+#define BPM_MAX               250.0f
+#define PARTY_FRAME_MS        33
+#define PARTY_SEG_LEN         32
+#define PARTY_BEATS_PER_LOOP  4
+#define PARTY_PULSE_FRAC      20
+#define BORDER_INSET          1
+
 typedef struct http_state {
     struct tcp_pcb *pcb;
     ip_addr_t remote_addr;
@@ -89,6 +113,7 @@ typedef struct {
     long progress_ms;
     long duration_ms;
     long remaining_ms;
+    float tempo;
     char mode[12];
     UBYTE title_bmp[TITLE_BMP_BYTES];
     UBYTE artist_bmp[ARTIST_BMP_BYTES];
@@ -97,6 +122,18 @@ typedef struct {
 
 static int last_remaining_ms = 0;
 static bool last_minimalist = false;
+static track_snapshot_t g_snap;
+static bool g_have_snap = false;
+static float g_tempo_bpm = DEFAULT_BPM;
+static UBYTE art_bmp[ART_BYTES];
+
+typedef enum { MODE_NORMAL, MODE_FIND_SONG } app_mode_t;
+static app_mode_t app_mode = MODE_NORMAL;
+static absolute_time_t find_times[FIND_MAX_TAPS];
+static int find_tap_count = 0;
+static absolute_time_t find_window_end;
+static absolute_time_t find_idle_deadline;
+static bool find_window_active = false;
 
 static UBYTE *oled_image;
 
@@ -306,7 +343,7 @@ static err_t http_poll(void *arg, struct tcp_pcb *pcb) {
 }
 
 static bool http_request(const char *method, const char *path,
-                         char *body_out, size_t body_cap) {
+                         char *body_out, size_t body_cap, uint32_t timeout_ms) {
     static char request[256];
     static http_state_t st;
 
@@ -331,7 +368,7 @@ static bool http_request(const char *method, const char *path,
     memset(&st, 0, sizeof(st));
     st.request = request;
     st.request_len = (size_t)len;
-    st.deadline = make_timeout_time_ms(5000);
+    st.deadline = make_timeout_time_ms(timeout_ms);
     ip4addr_aton(BRIDGE_IP, &st.remote_addr);
 
     st.pcb = tcp_new_ip_type(IP_GET_TYPE(&st.remote_addr));
@@ -384,7 +421,21 @@ static bool send_action(const char *command, char *result, size_t result_cap) {
     char path[64];
     snprintf(path, sizeof(path), "/action/%s", command);
     char body[256];
-    if (!http_request("POST", path, body, sizeof(body))) return false;
+    if (!http_request("POST", path, body, sizeof(body), 5000)) return false;
+    if (result && result_cap > 0) {
+        result[0] = '\0';
+        json_str_field(body, "result", result, result_cap);
+    }
+    return true;
+}
+
+static bool send_find_song(int bpm, char *result, size_t result_cap) {
+    // find-song is a multi-step bridge operation (recommendation + queue + skip)
+    // that can exceed 5s, so give it a dedicated longer timeout.
+    char path[64];
+    snprintf(path, sizeof(path), "/action/find-song?bpm=%d", bpm);
+    char body[256];
+    if (!http_request("POST", path, body, sizeof(body), 12000)) return false;
     if (result && result_cap > 0) {
         result[0] = '\0';
         json_str_field(body, "result", result, result_cap);
@@ -415,6 +466,12 @@ static long json_int_field(const char *json, const char *key) {
     const char *p = json_find(json, key);
     if (!p) return 0;
     return strtol(p, NULL, 10);
+}
+
+static float json_float_field(const char *json, const char *key) {
+    const char *p = json_find(json, key);
+    if (!p) return 0.0f;
+    return strtof(p, NULL);
 }
 
 static bool json_str_field(const char *json, const char *key, char *out, size_t out_cap) {
@@ -461,6 +518,7 @@ static bool parse_track(const char *body, track_snapshot_t *t) {
     t->progress_ms = json_int_field(body, "progress_ms");
     t->duration_ms = json_int_field(body, "duration_ms");
     t->remaining_ms = json_int_field(body, "remaining_ms");
+    t->tempo = json_float_field(body, "tempo");
     json_str_field(body, "mode", t->mode, sizeof(t->mode));
     if (!t->mode[0]) strcpy(t->mode, "default");
 
@@ -484,21 +542,9 @@ static void blit_bitmap(const UBYTE *bmp, int y0, int h) {
     }
 }
 
-static void render_track(const track_snapshot_t *t) {
+static void draw_track_content(const track_snapshot_t *t, bool show) {
     Paint_Clear(BLACK);
-
-    if (strcmp(t->mode, "minimalist") == 0) {
-        if (t->is_playing) {
-            draw_play(MINI_GLYPH_X, MINI_GLYPH_Y);
-        } else if (t->duration_ms > 0) {
-            draw_pause(MINI_GLYPH_X, MINI_GLYPH_Y);
-        }
-        blit_bitmap(t->title_bmp, MINI_TITLE_Y, MINI_TITLE_H);
-        blit_bitmap(t->artist_bmp, MINI_ARTIST_Y, MINI_ARTIST_H);
-        blit_bitmap(t->album_bmp, MINI_ALBUM_Y, MINI_ALBUM_H);
-        OLED_1in3_C_Display(oled_image);
-        return;
-    }
+    if (!show) return;
 
     if (t->is_playing) {
         draw_play(ICON_X, ICON_Y);
@@ -523,25 +569,181 @@ static void render_track(const track_snapshot_t *t) {
     fmt_time(t->duration_ms, dur, sizeof(dur));
     snprintf(timebuf, sizeof(timebuf), "%s / %s", cur, dur);
     Paint_DrawString_EN(0, TIME_Y, timebuf, &Font8, WHITE, BLACK);
+}
 
+static void render_track(const track_snapshot_t *t) {
+    if (strcmp(t->mode, "minimalist") == 0) {
+        Paint_Clear(BLACK);
+        if (t->is_playing) {
+            draw_play(MINI_GLYPH_X, MINI_GLYPH_Y);
+        } else if (t->duration_ms > 0) {
+            draw_pause(MINI_GLYPH_X, MINI_GLYPH_Y);
+        }
+        blit_bitmap(t->title_bmp, MINI_TITLE_Y, MINI_TITLE_H);
+        blit_bitmap(t->artist_bmp, MINI_ARTIST_Y, MINI_ARTIST_H);
+        blit_bitmap(t->album_bmp, MINI_ALBUM_Y, MINI_ALBUM_H);
+        OLED_1in3_C_Display(oled_image);
+        return;
+    }
+    draw_track_content(t, true);
+    OLED_1in3_C_Display(oled_image);
+}
+
+static void perimeter_point(int s, int *x, int *y) {
+    const int W = 128 - 2 * BORDER_INSET;
+    const int H = 64 - 2 * BORDER_INSET;
+    int P = 2 * (W + H);
+    s %= P;
+    if (s < W) {
+        *x = BORDER_INSET + s; *y = BORDER_INSET;
+    } else if (s < W + H) {
+        *x = BORDER_INSET + W - 1; *y = BORDER_INSET + (s - W);
+    } else if (s < 2 * W + H) {
+        *x = BORDER_INSET + W - 1 - (s - W - H); *y = BORDER_INSET + H - 1;
+    } else {
+        *x = BORDER_INSET; *y = BORDER_INSET + H - 1 - (s - 2 * W - H);
+    }
+}
+
+static void draw_party_frame(int elapsed_ms) {
+    float bpm = g_tempo_bpm;
+    if (bpm < BPM_MIN) bpm = BPM_MIN;
+    if (bpm > BPM_MAX) bpm = BPM_MAX;
+    int beat_ms = (int)(60000.0f / bpm);
+    if (beat_ms < 1) beat_ms = 1;
+    int bar_ms = PARTY_BEATS_PER_LOOP * beat_ms;
+
+    int phase = elapsed_ms % beat_ms;
+    bool on_beat = (phase * 100 < beat_ms * PARTY_PULSE_FRAC);
+
+    // Entire track content blinks on the beat.
+    draw_track_content(&g_snap, !on_beat);
+
+    // Rotating bright segment, clockwise, one loop per bar; pulses on the beat.
+    const int P = 2 * ((128 - 2 * BORDER_INSET) + (64 - 2 * BORDER_INSET));
+    int head = (int)(((int64_t)(elapsed_ms % bar_ms) * P) / bar_ms % P);
+    DOT_PIXEL seg_w = on_beat ? DOT_PIXEL_3X3 : DOT_PIXEL_1X1;
+    for (int d = 0; d < PARTY_SEG_LEN; d++) {
+        int x, y;
+        perimeter_point((head + d) % P, &x, &y);
+        Paint_DrawPoint((UWORD)x, (UWORD)y, WHITE, seg_w, DOT_FILL_AROUND);
+    }
+
+    OLED_1in3_C_Display(oled_image);
+}
+
+static bool fetch_art(void) {
+    static char body[HTTP_RESPONSE_MAX];
+    if (!http_request("GET", "/art", body, sizeof(body), 5000)) return false;
+    const char *p = json_find(body, "art_bmp");
+    if (!p) return false;
+    json_hex_field(body, "art_bmp", art_bmp, ART_BYTES);
+    for (int i = 0; i < ART_BYTES; i++) {
+        if (art_bmp[i]) return true;
+    }
+    return false;
+}
+
+static void render_art_screen(const char *label) {
+    Paint_Clear(BLACK);
+    for (int r = 0; r < ART_H; r++) {
+        for (int c = 0; c < ART_W; c++) {
+            if (art_bmp[r * (ART_W / 8) + c / 8] & (0x80 >> (c % 8))) {
+                int x = ART_X + c;
+                int y = ART_Y + r;
+                oled_image[y * BMP_ROW_BYTES + x / 8] |= (0x80 >> (x % 8));
+            }
+        }
+    }
+    Paint_DrawString_EN(0, 6, label, &Font16, WHITE, BLACK);
     OLED_1in3_C_Display(oled_image);
 }
 
 static void poll_track(void) {
     static char body[HTTP_RESPONSE_MAX];
-    track_snapshot_t snap;
 
-    if (!http_request("GET", "/track", body, sizeof(body))) {
+    if (!http_request("GET", "/track", body, sizeof(body), 5000)) {
         oled_show_text("Bridge", "offline");
         return;
     }
-    if (!parse_track(body, &snap)) {
+    if (!parse_track(body, &g_snap)) {
         oled_show_text("Bad response", "");
         return;
     }
-    last_minimalist = (strcmp(snap.mode, "minimalist") == 0);
-    last_remaining_ms = (int)snap.remaining_ms;
-    render_track(&snap);
+    g_have_snap = true;
+    last_minimalist = (strcmp(g_snap.mode, "minimalist") == 0);
+    last_remaining_ms = (int)g_snap.remaining_ms;
+    g_tempo_bpm = g_snap.tempo;
+    if (strcmp(g_snap.mode, "party") != 0) {
+        render_track(&g_snap);
+    }
+}
+
+static int compute_tap_bpm(const absolute_time_t *times, int n) {
+    if (n < 2) return 0;
+    uint64_t sum_us = 0;
+    for (int i = 1; i < n; i++) {
+        sum_us += (uint64_t)absolute_time_diff_us(times[i - 1], times[i]);
+    }
+    uint64_t avg_us = sum_us / (n - 1);
+    if (avg_us == 0) return 0;
+    int bpm = (int)(60000000ULL / avg_us);
+    if (bpm < TAP_BPM_MIN) bpm = TAP_BPM_MIN;
+    if (bpm > TAP_BPM_MAX) bpm = TAP_BPM_MAX;
+    return bpm;
+}
+
+static void enter_find_song_mode(void) {
+    app_mode = MODE_FIND_SONG;
+    find_window_active = false;
+    find_tap_count = 0;
+    find_idle_deadline = make_timeout_time_ms(FIND_IDLE_MS);
+    oled_show_text("Find song", "Tap to start");
+}
+
+static void find_song_tap(void) {
+    absolute_time_t now = get_absolute_time();
+    if (!find_window_active) {
+        find_window_active = true;
+        find_tap_count = 0;
+        find_window_end = make_timeout_time_ms(FIND_WINDOW_MS);
+    }
+    if (find_tap_count < FIND_MAX_TAPS) {
+        find_times[find_tap_count++] = now;
+    }
+    int bpm = compute_tap_bpm(find_times, find_tap_count);
+    if (bpm > 0) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "~%d BPM", bpm);
+        oled_show_text("Find song", buf);
+    } else {
+        oled_show_text("Find song", "Tap tempo");
+    }
+}
+
+static void finish_find_song(void) {
+    if (find_tap_count >= FIND_MIN_TAPS) {
+        int bpm = compute_tap_bpm(find_times, find_tap_count);
+        char result[32];
+        bool ok = send_find_song(bpm, result, sizeof(result)) && result[0];
+        if (ok)
+            oled_show_text("Now playing", result);
+        else
+            oled_show_text("Find song", "Failed");
+    } else {
+        oled_show_text("Find song", "Try again");
+    }
+    hold_feedback();
+    app_mode = MODE_NORMAL;
+}
+
+static void find_song_tick(void) {
+    if (find_window_active && time_reached(find_window_end)) {
+        find_window_active = false;
+        finish_find_song();
+    } else if (!find_window_active && time_reached(find_idle_deadline)) {
+        app_mode = MODE_NORMAL;
+    }
 }
 
 static void dispatch_gesture(int taps) {
@@ -554,12 +756,29 @@ static void dispatch_gesture(int taps) {
         case 4:  command = "minimalist";          fallback = "Minimalist"; break;
         case 5:  command = "party";               fallback = "Party";      break;
         default:
-            oled_show_text("calm down", "");
-            hold_feedback();
+            enter_find_song_mode();
             return;
     }
     char result[32];
-    if (send_action(command, result, sizeof(result)) && result[0])
+    bool ok = send_action(command, result, sizeof(result)) && result[0];
+
+    if (strcmp(command, "party") == 0) {
+        if (!ok) {
+            oled_show_text("Party", "Failed");
+        } else if (strcmp(result, "Party on") == 0) {
+            if (!fetch_art()) {
+                oled_show_text("Party on", "");
+            } else {
+                render_art_screen(result);
+            }
+        } else {
+            oled_show_text(result, "");  // "Party off"
+        }
+        hold_feedback();
+        return;
+    }
+
+    if (ok)
         oled_show_text(result, "");
     else
         oled_show_text(fallback, "Failed");
@@ -607,6 +826,7 @@ int main() {
     absolute_time_t multi_tap_deadline;
 
     absolute_time_t next_poll = get_absolute_time();
+    absolute_time_t next_party_frame = 0;
 
     while (true) {
         bool pressed = !gpio_get(BUTTON_PIN);
@@ -615,31 +835,37 @@ int main() {
             button_pressed = pressed;
             debounce_until = make_timeout_time_ms(DEBOUNCE_MS);
 
-            if (pressed) {
-                press_start = get_absolute_time();
-                long_press_fired = false;
-            } else {
-                if (!long_press_fired) {
+            if (app_mode == MODE_NORMAL) {
+                if (pressed) {
+                    press_start = get_absolute_time();
+                    long_press_fired = false;
+                } else if (!long_press_fired) {
                     tap_count++;
                     multi_tap_deadline = make_timeout_time_ms(MULTI_TAP_WINDOW_MS);
                     render_eyes(tap_count);
                 }
+            } else if (!pressed) {
+                find_song_tap();
             }
         }
 
-        if (button_pressed && !long_press_fired &&
-            absolute_time_diff_us(press_start, get_absolute_time()) >= LONG_PRESS_MS * 1000) {
-            long_press_fired = true;
-            tap_count = 0;
-            long_press();
+        if (app_mode == MODE_NORMAL) {
+            if (button_pressed && !long_press_fired &&
+                absolute_time_diff_us(press_start, get_absolute_time()) >= LONG_PRESS_MS * 1000) {
+                long_press_fired = true;
+                tap_count = 0;
+                long_press();
+            }
+
+            if (tap_count > 0 && time_reached(multi_tap_deadline)) {
+                dispatch_gesture(tap_count);
+                tap_count = 0;
+            }
+        } else {
+            find_song_tick();
         }
 
-        if (tap_count > 0 && time_reached(multi_tap_deadline)) {
-            dispatch_gesture(tap_count);
-            tap_count = 0;
-        }
-
-        if (time_reached(next_poll)) {
+        if (app_mode == MODE_NORMAL && time_reached(next_poll)) {
             int interval = POLL_DEFAULT_MS;
             if (last_minimalist && !(last_remaining_ms > 0 && last_remaining_ms <= END_THRESHOLD_MS))
                 interval = POLL_IDLE_MS;
@@ -647,6 +873,14 @@ int main() {
             if (tap_count == 0 && time_reached(feedback_until)) {
                 poll_track();
             }
+        }
+
+        if (app_mode == MODE_NORMAL && g_have_snap && strcmp(g_snap.mode, "party") == 0 &&
+            tap_count == 0 && time_reached(feedback_until) &&
+            time_reached(next_party_frame)) {
+            next_party_frame = make_timeout_time_ms(PARTY_FRAME_MS);
+            int elapsed_ms = (int)to_ms_since_boot(get_absolute_time());
+            draw_party_frame(elapsed_ms);
         }
 
         sleep_ms(10);
