@@ -11,7 +11,7 @@ A wireless music controller built with a **Raspberry Pi Pico W** for Spotify. Th
 - **spotipy** - Spotify Web API client used to fetch track metadata, playlists, and stream URLs
   - **requests** - HTTP library used for low-level API calls and downloading audio data
 - **python-dotenv** - loads environment variables (Spotify credentials) from a local `.env` file
-= **pillow** - imaging library to add image processing capabilities
+- **pillow** - imaging library to add image processing capabilities
 
 ## Getting started
 - Set `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and `SPOTIFY_REDIRECT_URI` in a `.env` file in the `bridge/` directory
