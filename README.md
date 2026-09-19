@@ -30,3 +30,10 @@ FastAPI automatically generates interactive API docs. With the server running, o
 - `http://localhost:5000/redoc` - alternative ReDoc view
 
 Note: `/action` commands require an active Spotify playback device (desktop app, phone, or web player).
+
+## Reset w/o BOOTSEl
+- 1200-baud serial reset
+```powershell
+$p = New-Object System.IO.Ports.SerialPort COM5,1200,None,8,one
+$p.Open(); $p.Close()
+```
