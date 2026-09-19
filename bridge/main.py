@@ -421,6 +421,39 @@ def callback(code: str):
     raise HTTPException(status_code=400, detail="Failed to retrieve access token.")
 
 
+# Personality strings for playback feedback, keyed by the active mode.
+# Minimalist stays plain on purpose; default and party get the fun wording.
+_PLAY_TEXT = {
+    "default": "setting the vibes",
+    "party": "jumpin' back in!",
+    "minimalist": "Play",
+}
+_PAUSE_TEXT = {
+    "default": "waiting for u...",
+    "party": "who killed it?",
+    "minimalist": "Pause",
+}
+_NEXT_TEXT = {
+    "default": "changin' it up!",
+    "party": "rock n rollin!",
+    "minimalist": "Next",
+}
+_PREV_TEXT = {
+    "default": "windin' back",
+    "party": "got ur back!",
+    "minimalist": "Previous",
+}
+_RESTART_TEXT = {
+    "default": "from the top",
+    "party": "roll it back!",
+    "minimalist": "Restart",
+}
+
+
+def _mode_text(table, plain):
+    return table.get(current_mode, plain)
+
+
 @app.post("/action/{command}")
 def handle_action(command: str, bpm: int = 0):
     """
@@ -440,58 +473,58 @@ def handle_action(command: str, bpm: int = 0):
             result = _find_song(sp, bpm)
         elif command == "play":
             sp.start_playback()
-            result = "Play"
+            result = _mode_text(_PLAY_TEXT, "Play")
         elif command == "pause":
             sp.pause_playback()
-            result = "Pause"
+            result = _mode_text(_PAUSE_TEXT, "Pause")
         elif command == "play-pause":
             # Toggle play/pause state dynamically
             playback = sp.current_playback()
             if playback and playback.get("is_playing"):
                 sp.pause_playback()
-                result = "Pause"
+                result = _mode_text(_PAUSE_TEXT, "Pause")
             else:
                 sp.start_playback()
-                result = "Play"
+                result = _mode_text(_PLAY_TEXT, "Play")
         elif command == "next":
             sp.next_track()
-            result = "Next"
+            result = _mode_text(_NEXT_TEXT, "Next")
         elif command == "previous":
             sp.previous_track()
-            result = "Previous"
+            result = _mode_text(_PREV_TEXT, "Previous")
         elif command == "restart":
             # Restart current track (seek to 0ms)
             sp.seek_track(position_ms=0)
-            result = "Restart"
+            result = _mode_text(_RESTART_TEXT, "Restart")
         elif command == "previous-or-restart":
             # Restart current track if it's been playing >= 4s, otherwise skip to previous
             playback = sp.current_playback()
             if playback and playback.get("progress_ms", 0) >= 10000:
                 sp.seek_track(position_ms=0)
-                result = "Restart"
+                result = _mode_text(_RESTART_TEXT, "Restart")
             else:
                 sp.previous_track()
-                result = "Previous"
+                result = _mode_text(_PREV_TEXT, "Previous")
         elif command == "minimalist":
             # Toggle minimalist mode (single mode at a time)
             if current_mode == "minimalist":
                 current_mode = "default"
-                result = "Minimalist off"
+                result = "takin' it easy!"
             else:
                 if current_mode == "party":
                     _safe_shuffle(sp, False)  # party's side effect off
                 current_mode = "minimalist"
-                result = "Minimalist on"
+                result = "time to lock in"
         elif command == "party":
             # Toggle party mode and shuffle playback (single mode at a time)
             if current_mode == "party":
                 current_mode = "default"
                 _safe_shuffle(sp, False)
-                result = "Party off"
+                result = "that was fire!"
             else:
                 current_mode = "party"
                 _safe_shuffle(sp, True)
-                result = "Party on"
+                result = "let's party!"
         elif command == "favourite":
             # Save the currently playing track to Liked Songs
             track = sp.current_user_playing_track()
