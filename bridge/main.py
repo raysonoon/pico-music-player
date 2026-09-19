@@ -424,7 +424,7 @@ def callback(code: str):
 # Personality strings for playback feedback, keyed by the active mode.
 # Minimalist stays plain on purpose; default and party get the fun wording.
 _PLAY_TEXT = {
-    "default": "setting the vibes",
+    "default": "bringin' vibes",
     "party": "jumpin' back in!",
     "minimalist": "Play",
 }
