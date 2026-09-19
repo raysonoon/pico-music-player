@@ -55,6 +55,7 @@ pico_enable_stdio_usb(pico-music-player 1)
 # Add the standard library to the build
 target_link_libraries(pico-music-player
         pico_stdlib
+        m
         Config
         OLED
         GUI

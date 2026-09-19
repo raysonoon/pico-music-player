@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
@@ -29,6 +30,12 @@
 #define FIND_IDLE_MS          5000    // auto-exit if mode entered but never tapped
 #define TAP_BPM_MIN           40
 #define TAP_BPM_MAX           250
+#define FIND_RENDER_MS        33      // live bar frame cadence (mirrors PARTY_FRAME_MS)
+#define FIND_DECAY_TAU_MS     3000    // exponential decay time constant (tunable)
+#define FIND_PULSE_FRAC       20      // on-beat blink duty (mirrors PARTY_PULSE_FRAC)
+#define FIND_BAR_Y            50
+#define FIND_BAR_H            6
+#define FIND_FOOTER_Y         (FIND_BAR_Y + FIND_BAR_H)   // 56
 
 // Now-playing poll + display layout
 #define POLL_DEFAULT_MS       1000
@@ -134,6 +141,7 @@ static int find_tap_count = 0;
 static absolute_time_t find_window_end;
 static absolute_time_t find_idle_deadline;
 static bool find_window_active = false;
+static absolute_time_t next_find_frame;
 
 static UBYTE *oled_image;
 
@@ -187,27 +195,6 @@ static void oled_show_msg(const char *msg) {
         f = &Font8;  fy = (64 - f->Height) / 2;
     }
     paint_centered(fy, msg, f);
-    OLED_1in3_C_Display(oled_image);
-}
-
-// Find-a-song feedback: Font12 phrase (1-2 lines) with optional Font8 footer below.
-static void find_song_show(const char *pa, const char *pb, const char *footer) {
-    Paint_Clear(BLACK);
-    int n = (pa && pa[0]) + (pb && pb[0]);
-    int has_footer = (footer && footer[0]);
-    int y;
-    if (has_footer) {
-        y = (44 - n * 12) / 2;   // center phrase in the area above the footer
-        if (y < 0) y = 0;
-    } else {
-        y = (64 - n * 12) / 2;   // center phrase vertically on the whole screen
-    }
-    if (pa && pa[0]) {
-        paint_centered(y, pa, &Font12);
-        y += 12;
-    }
-    if (pb && pb[0]) paint_centered(y, pb, &Font12);
-    if (has_footer) paint_centered(50, footer, &Font8);
     OLED_1in3_C_Display(oled_image);
 }
 
@@ -310,13 +297,13 @@ static void animate_love_face(void) {
     }
 }
 
-static void draw_progress_bar(int percent) {
-    Paint_DrawRectangle(0, BAR_Y, 127, BAR_Y + BAR_H - 1, WHITE, DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
+static void draw_progress_bar(int y, int percent) {
+    Paint_DrawRectangle(0, y, 127, y + BAR_H - 1, WHITE, DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
     if (percent > 0) {
         int fill = (percent * 126) / 100;
         if (fill < 1) fill = 1;
         if (fill > 126) fill = 126;
-        Paint_DrawRectangle(1, BAR_Y + 1, fill, BAR_Y + BAR_H - 2, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+        Paint_DrawRectangle(1, y + 1, fill, y + BAR_H - 2, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
     }
 }
 
@@ -611,7 +598,7 @@ static void draw_track_content(const track_snapshot_t *t, bool show) {
         if (percent < 0) percent = 0;
         if (percent > 100) percent = 100;
     }
-    draw_progress_bar(percent);
+    draw_progress_bar(BAR_Y, percent);
 
     char cur[16], dur[16], timebuf[32];
     fmt_time(t->progress_ms, cur, sizeof(cur));
@@ -742,18 +729,65 @@ static int compute_tap_bpm(const absolute_time_t *times, int n) {
     return bpm;
 }
 
+// Live BPM for the find-a-song bar: holds the measured tempo while tapping stays
+// on-beat, then decays exponentially (measured * e^(-t/TAU)) once one beat passes.
+static int live_find_bpm(void) {
+    if (find_tap_count < 2) return 0;
+    int measured = compute_tap_bpm(find_times, find_tap_count);
+    int64_t avg_ms = 60000 / measured;
+    int64_t since = (int64_t)absolute_time_diff_us(find_times[find_tap_count - 1], get_absolute_time()) / 1000;
+    if (since <= avg_ms) return measured;
+    int64_t t = since - avg_ms;
+    return (int)((float)measured * expf(-(float)t / (float)FIND_DECAY_TAU_MS));
+}
+
+// Personality phrase for a tapped tempo, matching the bridge's 80/115/140 bands.
 typedef struct {
     const char *a;
     const char *b;
 } phrase_t;
 
-// Personality phrase for a tapped tempo, matching the bridge's 80/115/140 bands.
 // Long phrases split across two Font12 lines (b == NULL for short ones).
 static phrase_t bpm_phrase(int bpm) {
     if (bpm < 80)  return (phrase_t){ "takin' a", "chill pill" };
     if (bpm < 115) return (phrase_t){ "catchin' the", "groove" };
     if (bpm < 140) return (phrase_t){ "fast & curious", NULL };
     return (phrase_t){ "FULL SPEED AHEAD", NULL };
+}
+
+// Live find-a-song frame, driven from main() like party mode: phrase + a BPM
+// progress bar whose fill blinks off on the beat (pulse anchored to the last tap).
+// With a footer, the bar freezes at the measured BPM (no blink) and the text
+// renders below the bar instead of draining with the live BPM.
+static void draw_find_frame(const char *footer) {
+    int measured = compute_tap_bpm(find_times, find_tap_count);
+    int bpm = footer ? measured : live_find_bpm();
+    bool on_beat = false;
+    if (!footer && measured > 0) {
+        int beat_ms = 60000 / measured;
+        if (beat_ms < 1) beat_ms = 1;
+        int64_t since = (int64_t)absolute_time_diff_us(find_times[find_tap_count - 1], get_absolute_time()) / 1000;
+        int phase = (int)(since % beat_ms);
+        on_beat = (phase * 100 < beat_ms * FIND_PULSE_FRAC);
+    }
+
+    Paint_Clear(BLACK);
+    phrase_t p = (bpm > 0) ? bpm_phrase(bpm) : (phrase_t){ "keep tapping...", NULL };
+    int n = (p.a && p.a[0]) + (p.b && p.b[0]);
+    int y = (FIND_BAR_Y - 4 - n * 12) / 2;
+    if (y < 0) y = 0;
+    if (p.a && p.a[0]) {
+        paint_centered(y, p.a, &Font12);
+        y += 12;
+    }
+    if (p.b && p.b[0]) paint_centered(y, p.b, &Font12);
+
+    int pct = (bpm - TAP_BPM_MIN) * 100 / (TAP_BPM_MAX - TAP_BPM_MIN);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    draw_progress_bar(FIND_BAR_Y, on_beat ? 0 : pct);
+    if (footer && footer[0]) paint_centered(FIND_FOOTER_Y, footer, &Font8);
+    OLED_1in3_C_Display(oled_image);
 }
 
 static void enter_find_song_mode(void) {
@@ -774,18 +808,10 @@ static void find_song_tap(void) {
         find_window_active = true;
         find_tap_count = 0;
         find_window_end = make_timeout_time_ms(FIND_WINDOW_MS);
+        next_find_frame = get_absolute_time();
     }
     if (find_tap_count < FIND_MAX_TAPS) {
         find_times[find_tap_count++] = now;
-    }
-    int bpm = compute_tap_bpm(find_times, find_tap_count);
-    if (bpm > 0) {
-        phrase_t p = bpm_phrase(bpm);
-        char buf[16];
-        snprintf(buf, sizeof(buf), "~%d BPM", bpm);
-        find_song_show(p.a, p.b, buf);
-    } else {
-        find_song_show("keep tapping...", NULL, NULL);
     }
 }
 
@@ -798,10 +824,10 @@ static void capture_art(UBYTE *dst) {
 
 static void finish_find_song(void) {
     int bpm = compute_tap_bpm(find_times, find_tap_count);
-    phrase_t p = (bpm > 0) ? bpm_phrase(bpm) : (phrase_t){ "keep tapping...", NULL };
     if (find_tap_count >= FIND_MIN_TAPS) {
         // Snapshot the old art before the skip, then wait for /art to reflect
         // the newly recommended track (bounded ~5s, no fixed delay).
+        draw_find_frame("let me cook...");
         UBYTE prev[ART_BYTES];
         capture_art(prev);
         char result[32];
@@ -814,10 +840,10 @@ static void finish_find_song(void) {
             }
             render_art_screen("found ur jam!");
         } else {
-            find_song_show(p.a, p.b, "no vibes matched :(");
+            oled_show_msg("no vibes matched :(");
         }
     } else {
-        find_song_show(p.a, p.b, "don't ghost me :(");
+        oled_show_msg("don't ghost me :(");
     }
     hold_feedback();
     app_mode = MODE_NORMAL;
@@ -964,6 +990,11 @@ int main() {
             next_party_frame = make_timeout_time_ms(PARTY_FRAME_MS);
             int elapsed_ms = (int)to_ms_since_boot(get_absolute_time());
             draw_party_frame(elapsed_ms);
+        }
+
+        if (app_mode == MODE_FIND_SONG && find_window_active && time_reached(next_find_frame)) {
+            next_find_frame = make_timeout_time_ms(FIND_RENDER_MS);
+            draw_find_frame(NULL);
         }
 
         sleep_ms(10);
