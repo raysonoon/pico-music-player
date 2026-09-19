@@ -14,8 +14,8 @@
 #include "OLED_1in3_c.h"
 #include "GUI_Paint.h"
 
-// Push button on GPIO15 (active-low: pressed reads 0)
-#define BUTTON_PIN            15
+// Push button on GPIO21 (active-low: pressed reads 0)
+#define BUTTON_PIN            21
 #define DEBOUNCE_MS           25
 #define LONG_PRESS_MS         1000
 #define MULTI_TAP_WINDOW_MS   700
@@ -51,13 +51,13 @@
 #define ALBUM_BMP_BYTES       (BMP_ROW_BYTES * ALBUM_BUF_H)
 
 #define ICON_X                2
-#define ICON_Y                1
-#define TITLE_Y               0
-#define ARTIST_Y              13
-#define ALBUM_Y               26
-#define BAR_Y                 38
+#define ICON_Y                6
+#define TITLE_Y               3
+#define ARTIST_Y              16
+#define ALBUM_Y               29
+#define BAR_Y                 41
 #define BAR_H                 6
-#define TIME_Y                44
+#define TIME_Y                47
 
 // Minimalist mode layout (must match the bridge rendering)
 #define MINI_TITLE_H          TITLE_BUF_H
@@ -65,9 +65,9 @@
 #define MINI_ALBUM_H          ALBUM_BUF_H
 #define MINI_GLYPH_X          2
 #define MINI_GLYPH_Y          11
-#define MINI_TITLE_Y          6
-#define MINI_ARTIST_Y         27
-#define MINI_ALBUM_Y          42
+#define MINI_TITLE_Y          5
+#define MINI_ARTIST_Y         25
+#define MINI_ALBUM_Y          40
 
 // Heart (Favourite) animation layout
 #define HEART_CY              30
@@ -164,6 +164,53 @@ static void oled_show_text(const char *line1, const char *line2) {
     OLED_1in3_C_Display(oled_image);
 }
 
+// Draw a string horizontally centered at row y, using a given font.
+static void paint_centered(int y, const char *s, sFONT *f) {
+    int w = (int)strlen(s) * (int)f->Width;
+    int x = (128 - w) / 2;
+    if (x < 0) x = 0;
+    Paint_DrawString_EN((UWORD)x, (UWORD)y, s, f, WHITE, BLACK);
+}
+
+// Show a single personality message, auto-sizing the font to fit the width.
+// Font16 <= 11 chars, Font12 <= 18 chars, otherwise Font8.
+static void oled_show_msg(const char *msg) {
+    Paint_Clear(BLACK);
+    size_t n = strlen(msg);
+    sFONT *f;
+    int fy;
+    if (n <= 11) {
+        f = &Font16; fy = (64 - f->Height) / 2;
+    } else if (n <= 18) {
+        f = &Font12; fy = (64 - f->Height) / 2;
+    } else {
+        f = &Font8;  fy = (64 - f->Height) / 2;
+    }
+    paint_centered(fy, msg, f);
+    OLED_1in3_C_Display(oled_image);
+}
+
+// Find-a-song feedback: Font12 phrase (1-2 lines) with optional Font8 footer below.
+static void find_song_show(const char *pa, const char *pb, const char *footer) {
+    Paint_Clear(BLACK);
+    int n = (pa && pa[0]) + (pb && pb[0]);
+    int has_footer = (footer && footer[0]);
+    int y;
+    if (has_footer) {
+        y = (44 - n * 12) / 2;   // center phrase in the area above the footer
+        if (y < 0) y = 0;
+    } else {
+        y = (64 - n * 12) / 2;   // center phrase vertically on the whole screen
+    }
+    if (pa && pa[0]) {
+        paint_centered(y, pa, &Font12);
+        y += 12;
+    }
+    if (pb && pb[0]) paint_centered(y, pb, &Font12);
+    if (has_footer) paint_centered(50, footer, &Font8);
+    OLED_1in3_C_Display(oled_image);
+}
+
 static void fmt_time(long ms, char *buf, size_t bufsz) {
     long s = ms / 1000;
     if (s < 0) s = 0;
@@ -172,7 +219,7 @@ static void fmt_time(long ms, char *buf, size_t bufsz) {
 
 static void draw_play(int x0, int y0) {
     const int w = 9;
-    const int h = 11;
+    const int h = 9;
     const int half = h / 2;
     for (int r = 0; r < h; r++) {
         int t = r - half;
@@ -184,8 +231,8 @@ static void draw_play(int x0, int y0) {
 }
 
 static void draw_pause(int x0, int y0) {
-    Paint_DrawRectangle(x0, y0, x0 + 2, y0 + 10, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-    Paint_DrawRectangle(x0 + 5, y0, x0 + 7, y0 + 10, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+    Paint_DrawRectangle(x0, y0, x0 + 2, y0 + 9, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+    Paint_DrawRectangle(x0 + 5, y0, x0 + 7, y0 + 9, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
 }
 
 static void draw_heart(int cx, int cy, int scale) {
@@ -203,11 +250,6 @@ static void draw_heart(int cx, int cy, int scale) {
             }
         }
     }
-}
-
-static void draw_hearts(int scale) {
-    draw_heart(64 - HEART_OFFSET, HEART_CY, scale);
-    draw_heart(64 + HEART_OFFSET, HEART_CY, scale);
 }
 
 static void draw_eye(int cx, int cy, int r) {
@@ -251,12 +293,19 @@ static void render_eyes(int taps) {
     OLED_1in3_C_Display(oled_image);
 }
 
-static void animate_heart(void) {
-    static const int scales[] = { 8, 13, 10, 14, 11, 13 }; // ba-bum pulse
+// Love-struck face: pulsing heart-shaped eyes + a small grin below.
+static void render_love_face(int scale) {
+    Paint_Clear(BLACK);
+    draw_heart(64 - HEART_OFFSET, EYE_Y, scale);
+    draw_heart(64 + HEART_OFFSET, EYE_Y, scale);
+    draw_smile(64, SMILE_Y, SMILE_SPAN, 8);
+    OLED_1in3_C_Display(oled_image);
+}
+
+static void animate_love_face(void) {
+    static const int scales[] = { 7, 9, 7, 10, 8, 9 }; // heart-eye ba-bum pulse
     for (size_t i = 0; i < sizeof(scales) / sizeof(scales[0]); i++) {
-        Paint_Clear(BLACK);
-        draw_hearts(scales[i]);
-        OLED_1in3_C_Display(oled_image);
+        render_love_face(scales[i]);
         sleep_ms(110);
     }
 }
@@ -655,7 +704,7 @@ static void render_art_screen(const char *label) {
             }
         }
     }
-    Paint_DrawString_EN(0, 6, label, &Font16, WHITE, BLACK);
+    paint_centered(4, label, &Font12);
     OLED_1in3_C_Display(oled_image);
 }
 
@@ -663,7 +712,7 @@ static void poll_track(void) {
     static char body[HTTP_RESPONSE_MAX];
 
     if (!http_request("GET", "/track", body, sizeof(body), 5000)) {
-        oled_show_text("Bridge", "offline");
+        oled_show_msg("craving connection");
         return;
     }
     if (!parse_track(body, &g_snap)) {
@@ -693,12 +742,30 @@ static int compute_tap_bpm(const absolute_time_t *times, int n) {
     return bpm;
 }
 
+typedef struct {
+    const char *a;
+    const char *b;
+} phrase_t;
+
+// Personality phrase for a tapped tempo, matching the bridge's 80/115/140 bands.
+// Long phrases split across two Font12 lines (b == NULL for short ones).
+static phrase_t bpm_phrase(int bpm) {
+    if (bpm < 80)  return (phrase_t){ "takin' a", "chill pill" };
+    if (bpm < 115) return (phrase_t){ "catchin' the", "groove" };
+    if (bpm < 140) return (phrase_t){ "fast & curious", NULL };
+    return (phrase_t){ "FULL SPEED AHEAD", NULL };
+}
+
 static void enter_find_song_mode(void) {
     app_mode = MODE_FIND_SONG;
     find_window_active = false;
     find_tap_count = 0;
     find_idle_deadline = make_timeout_time_ms(FIND_IDLE_MS);
-    oled_show_text("Find song", "Tap to start");
+    Paint_Clear(BLACK);
+    paint_centered(8,  "feeling grumpy?", &Font12);
+    paint_centered(20, "let's find a song", &Font12);
+    paint_centered(44, "tap to start", &Font12);
+    OLED_1in3_C_Display(oled_image);
 }
 
 static void find_song_tap(void) {
@@ -713,25 +780,44 @@ static void find_song_tap(void) {
     }
     int bpm = compute_tap_bpm(find_times, find_tap_count);
     if (bpm > 0) {
+        phrase_t p = bpm_phrase(bpm);
         char buf[16];
         snprintf(buf, sizeof(buf), "~%d BPM", bpm);
-        oled_show_text("Find song", buf);
+        find_song_show(p.a, p.b, buf);
     } else {
-        oled_show_text("Find song", "Tap tempo");
+        find_song_show("keep tapping...", NULL, NULL);
     }
 }
 
+// Copy the current snapshot album art into dst (zeros if unavailable).
+static void capture_art(UBYTE *dst) {
+    memset(dst, 0, ART_BYTES);
+    fetch_art();
+    memcpy(dst, art_bmp, ART_BYTES);
+}
+
 static void finish_find_song(void) {
+    int bpm = compute_tap_bpm(find_times, find_tap_count);
+    phrase_t p = (bpm > 0) ? bpm_phrase(bpm) : (phrase_t){ "keep tapping...", NULL };
     if (find_tap_count >= FIND_MIN_TAPS) {
-        int bpm = compute_tap_bpm(find_times, find_tap_count);
+        // Snapshot the old art before the skip, then wait for /art to reflect
+        // the newly recommended track (bounded ~5s, no fixed delay).
+        UBYTE prev[ART_BYTES];
+        capture_art(prev);
         char result[32];
         bool ok = send_find_song(bpm, result, sizeof(result)) && result[0];
-        if (ok)
-            oled_show_text("Now playing", result);
-        else
-            oled_show_text("Find song", "Failed");
+        if (ok) {
+            for (int i = 0; i < 50; i++) {
+                sleep_ms(100);
+                fetch_art();
+                if (memcmp(prev, art_bmp, ART_BYTES) != 0) break;
+            }
+            render_art_screen("found ur jam!");
+        } else {
+            find_song_show(p.a, p.b, "no vibes matched :(");
+        }
     } else {
-        oled_show_text("Find song", "Try again");
+        find_song_show(p.a, p.b, "don't ghost me :(");
     }
     hold_feedback();
     app_mode = MODE_NORMAL;
@@ -765,21 +851,17 @@ static void dispatch_gesture(int taps) {
     if (strcmp(command, "party") == 0) {
         if (!ok) {
             oled_show_text("Party", "Failed");
-        } else if (strcmp(result, "Party on") == 0) {
-            if (!fetch_art()) {
-                oled_show_text("Party on", "");
-            } else {
-                render_art_screen(result);
-            }
+        } else if (strcmp(result, "let's party!") == 0) {
+            oled_show_msg("let's party!");
         } else {
-            oled_show_text(result, "");  // "Party off"
+            oled_show_msg(result);  // "that was fire!"
         }
         hold_feedback();
         return;
     }
 
     if (ok)
-        oled_show_text(result, "");
+        oled_show_msg(result);
     else
         oled_show_text(fallback, "Failed");
     hold_feedback();
@@ -787,8 +869,9 @@ static void dispatch_gesture(int taps) {
 
 static void long_press(void) {
     hold_feedback();
-    animate_heart();
-    if (!send_action("favourite", NULL, 0)) {
+    if (send_action("favourite", NULL, 0)) {
+        animate_love_face();
+    } else {
         oled_show_text("Favourite", "Failed");
         hold_feedback();
     }
