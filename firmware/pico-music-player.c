@@ -167,7 +167,7 @@ static void oled_init(void) {
 
 static void oled_show_text(const char *line1, const char *line2) {
     Paint_Clear(BLACK);
-    Paint_DrawString_EN(0, 6,  line1, &Font16, WHITE, BLACK);
+    Paint_DrawString_EN(0, 16,  line1, &Font16, WHITE, BLACK);
     Paint_DrawString_EN(0, 36, line2, &Font12, WHITE, BLACK);
     OLED_1in3_C_Display(oled_image);
 }
@@ -710,7 +710,9 @@ static void poll_track(void) {
     last_minimalist = (strcmp(g_snap.mode, "minimalist") == 0);
     last_remaining_ms = (int)g_snap.remaining_ms;
     g_tempo_bpm = g_snap.tempo;
-    if (strcmp(g_snap.mode, "party") != 0) {
+    if (g_snap.duration_ms <= 0) {
+        oled_show_msg("feed me music!");
+    } else if (strcmp(g_snap.mode, "party") != 0) {
         render_track(&g_snap);
     }
 }
@@ -860,13 +862,13 @@ static void find_song_tick(void) {
 
 static void dispatch_gesture(int taps) {
     const char *command = NULL;
-    const char *fallback = NULL;
+    const char *failcmd = NULL;
     switch (taps) {
-        case 1:  command = "play-pause";          fallback = "Play/Pause"; break;
-        case 2:  command = "next";                fallback = "Next";       break;
-        case 3:  command = "previous-or-restart"; fallback = "Previous";   break;
-        case 4:  command = "minimalist";          fallback = "Minimalist"; break;
-        case 5:  command = "party";               fallback = "Party";      break;
+        case 1:  command = "play-pause";          failcmd = "play/pause"; break;
+        case 2:  command = "next";                failcmd = "next";       break;
+        case 3:  command = "previous-or-restart"; failcmd = "previous";   break;
+        case 4:  command = "minimalist";          failcmd = "minimalist"; break;
+        case 5:  command = "party";               failcmd = "party";      break;
         default:
             enter_find_song_mode();
             return;
@@ -876,7 +878,7 @@ static void dispatch_gesture(int taps) {
 
     if (strcmp(command, "party") == 0) {
         if (!ok) {
-            oled_show_text("Party", "Failed");
+            oled_show_text(failcmd, "failed");
         } else if (strcmp(result, "let's party!") == 0) {
             oled_show_msg("let's party!");
         } else {
@@ -889,7 +891,7 @@ static void dispatch_gesture(int taps) {
     if (ok)
         oled_show_msg(result);
     else
-        oled_show_text(fallback, "Failed");
+        oled_show_text(failcmd, "failed");
     hold_feedback();
 }
 
@@ -898,7 +900,7 @@ static void long_press(void) {
     if (send_action("favourite", NULL, 0)) {
         animate_love_face();
     } else {
-        oled_show_text("Favourite", "Failed");
+        oled_show_text("favourite", "failed");
         hold_feedback();
     }
 }
@@ -984,7 +986,8 @@ int main() {
             }
         }
 
-        if (app_mode == MODE_NORMAL && g_have_snap && strcmp(g_snap.mode, "party") == 0 &&
+        if (app_mode == MODE_NORMAL && g_have_snap && g_snap.duration_ms > 0 &&
+            strcmp(g_snap.mode, "party") == 0 &&
             tap_count == 0 && time_reached(feedback_until) &&
             time_reached(next_party_frame)) {
             next_party_frame = make_timeout_time_ms(PARTY_FRAME_MS);
