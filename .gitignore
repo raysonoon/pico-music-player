@@ -1,6 +1,7 @@
 build
 .vscode
 TODO.md
+PINOUT.md
 .env
 .cache
 __pycache__
