@@ -198,6 +198,32 @@ static void oled_show_msg(const char *msg) {
     OLED_1in3_C_Display(oled_image);
 }
 
+// Clip s to max_chars (appending "..."), then center-draw at y.
+static void paint_centered_clip(int y, const char *s, sFONT *f, int max_chars) {
+    char buf[64];
+    size_t n = strlen(s);
+    if (n > (size_t)max_chars) {
+        size_t keep = max_chars > 3 ? (size_t)(max_chars - 3) : 0;
+        memcpy(buf, s, keep);
+        memcpy(buf + keep, "...", 3);
+        buf[keep + 3] = '\0';
+    } else {
+        strncpy(buf, s, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+    }
+    paint_centered(y, buf, f);
+}
+
+// Two-line centered entry screen: message on top, playlist name below.
+static void oled_show_two_line(const char *line1, const char *line2) {
+    Paint_Clear(BLACK);
+    if (strlen(line1) <= 11) paint_centered_clip(18, line1, &Font16, 11);
+    else                     paint_centered_clip(18, line1, &Font12, 18);
+    if (strlen(line2) <= 18) paint_centered_clip(38, line2, &Font12, 18);
+    else                     paint_centered_clip(38, line2, &Font8, 25);
+    OLED_1in3_C_Display(oled_image);
+}
+
 static void fmt_time(long ms, char *buf, size_t bufsz) {
     long s = ms / 1000;
     if (s < 0) s = 0;
@@ -873,16 +899,20 @@ static void dispatch_gesture(int taps) {
             enter_find_song_mode();
             return;
     }
-    char result[32];
+    char result[64];
     bool ok = send_action(command, result, sizeof(result)) && result[0];
 
-    if (strcmp(command, "party") == 0) {
+    if (strcmp(command, "party") == 0 || strcmp(command, "minimalist") == 0) {
         if (!ok) {
             oled_show_text(failcmd, "failed");
-        } else if (strcmp(result, "let's party!") == 0) {
-            oled_show_msg("let's party!");
         } else {
-            oled_show_msg(result);  // "that was fire!"
+            char *sep = strchr(result, '|');
+            if (sep) {
+                *sep = '\0';
+                oled_show_two_line(result, sep + 1);
+            } else {
+                oled_show_msg(result);  // fallback / exit text
+            }
         }
         hold_feedback();
         return;

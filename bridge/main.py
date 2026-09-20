@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 import os
+import random
 import io
 import threading
 from contextlib import asynccontextmanager
@@ -15,6 +16,8 @@ POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1"))
 
 # In-memory mode state (set by gestures)
 current_mode = "default"
+_party_prev = None  # resume snapshot (context/track/shuffle) captured before party mode
+_mini_prev = None
 
 # Party mode: album art + tempo sync
 ART_SIZE = 40
@@ -50,6 +53,13 @@ BAND_SEEDS = {
 }
 FEATURE_WEIGHT = 2.0   # undocumented scale; tunable, verified against live API
 SPEECHINESS_CAP = 0.35  # reject candidates with more spoken word than this
+
+# Party mode: curated upbeat playlists, picked at random when party mode starts.
+PARTY_PLAYLISTS = {
+    "Today's Top Hits": "37i9dQZF1DXcBWIGoYBM5M",
+    "Just Hits": "37i9dQZF1DXcRXFNfZr7Tp",
+    "Party Hits 2010s": "37i9dQZF1DWWylYLMvjuRG",
+}
 
 # BPM bands -> label + audio-feature targets (seed = band genre + current track).
 BANDS = [
@@ -97,7 +107,7 @@ CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 
 # Permissions needed to control playback, read song info and save tracks
-SCOPE = "user-modify-playback-state user-read-playback-state user-library-modify"
+SCOPE = "user-modify-playback-state user-read-playback-state user-library-modify playlist-read-private"
 
 # Initialize Spotipy's SpotifyOAuth manager
 # cache_path='.cache' saves refresh tokens locally so you only log in once
@@ -247,6 +257,68 @@ def _safe_shuffle(sp, state):
         sp.shuffle(state)
     except Exception:
         pass
+
+
+def _capture_resume(sp):
+    """Snapshot the current playback for later resume: context + track + shuffle."""
+    try:
+        playback = sp.current_playback()
+    except Exception:
+        return None
+    if not playback or not playback.get("item"):
+        return None
+    ctx = playback.get("context") or {}
+    ctx_uri = ctx.get("uri") if ctx.get("type") in ("playlist", "album", "artist") else None
+    item = playback["item"]
+    uri = item.get("uri") or (f"spotify:track:{item['id']}" if item.get("id") else None)
+    return {
+        "context_uri": ctx_uri,
+        "track_uri": uri,
+        "shuffle": bool(playback.get("shuffle_state")),
+    }
+
+
+def _restore_resume(sp, snap):
+    """Restore the previous context at the same track (from 0ms) + its shuffle."""
+    if not snap:
+        return
+    if snap.get("context_uri"):
+        try:
+            sp.start_playback(context_uri=snap["context_uri"], offset={"uri": snap["track_uri"]})
+        except Exception:
+            pass
+    _safe_shuffle(sp, snap.get("shuffle", False))
+
+
+def _shuffle_only(snap):
+    """Keep only the shuffle state, dropping any context we didn't actually leave."""
+    return {"context_uri": None, "track_uri": None,
+            "shuffle": (snap or {}).get("shuffle", False)}
+
+
+# Keywords used to find a focus playlist for minimalist mode.
+MINI_KEYWORDS = ("study", "work", "focus", "lock in", "grind")
+
+
+def _find_focus_playlist(sp):
+    """Return a random (name, id) for a library playlist whose name contains a
+    MINI_KEYWORD, else None."""
+    try:
+        matches = []
+        offset = 0
+        while offset < 200:  # sanity cap
+            page = sp.current_user_playlists(limit=50, offset=offset)
+            items = page.get("items") or []
+            for pl in items:
+                name = (pl.get("name") or "").lower()
+                if any(k in name for k in MINI_KEYWORDS):
+                    matches.append((pl.get("name"), pl.get("id")))
+            if not items or not page.get("next"):
+                break
+            offset += len(items)
+        return random.choice(matches) if matches else None
+    except Exception:
+        return None
 
 
 def _get_tempo(track_id):
@@ -463,6 +535,8 @@ def handle_action(command: str, bpm: int = 0):
                         find-song (expects bpm query param)
     """
     global current_mode
+    global _party_prev
+    global _mini_prev
     sp = get_spotify_client()
     result = ""
 
@@ -506,25 +580,62 @@ def handle_action(command: str, bpm: int = 0):
                 sp.previous_track()
                 result = _mode_text(_PREV_TEXT, "Previous")
         elif command == "minimalist":
-            # Toggle minimalist mode (single mode at a time)
+            # Toggle minimalist mode (single mode at a time). On enter, play a
+            # random study/work/focus playlist with shuffle off; fall back to the
+            # current playlist if none found or starting one fails. On exit,
+            # revert to the pre-minimalist context. Entering from party folds in
+            # leaving party (its pre-context becomes the resume point).
             if current_mode == "minimalist":
                 current_mode = "default"
+                _restore_resume(sp, _mini_prev)
+                _mini_prev = None
                 result = "takin' it easy!"
             else:
                 if current_mode == "party":
-                    _safe_shuffle(sp, False)  # party's side effect off
+                    prev = _party_prev
+                    _party_prev = None
+                else:
+                    prev = _capture_resume(sp)
                 current_mode = "minimalist"
-                result = "time to lock in"
+                match = _find_focus_playlist(sp)
+                if match:
+                    name, pid = match
+                    try:
+                        sp.start_playback(context_uri=f"spotify:playlist:{pid}")
+                        _safe_shuffle(sp, True)
+                        _mini_prev = prev
+                        result = f"time to lock in|{name}"
+                    except Exception:
+                        _safe_shuffle(sp, True)
+                        _mini_prev = _shuffle_only(prev)
+                        result = "time to lock in"
+                else:
+                    _safe_shuffle(sp, True)
+                    _mini_prev = _shuffle_only(prev)
+                    result = "time to lock in"
         elif command == "party":
-            # Toggle party mode and shuffle playback (single mode at a time)
+            # Toggle party mode (single mode at a time). On enter, play and
+            # shuffle a random upbeat playlist; fall back to shuffling the
+            # current playlist if starting a curated one fails. On exit, revert
+            # to the pre-party context (same playlist/track, from the start).
             if current_mode == "party":
                 current_mode = "default"
-                _safe_shuffle(sp, False)
+                _restore_resume(sp, _party_prev)
+                _party_prev = None
                 result = "that was fire!"
             else:
+                prev = _capture_resume(sp)
                 current_mode = "party"
-                _safe_shuffle(sp, True)
-                result = "let's party!"
+                name, pid = random.choice(list(PARTY_PLAYLISTS.items()))
+                try:
+                    sp.start_playback(context_uri=f"spotify:playlist:{pid}")
+                    _safe_shuffle(sp, True)
+                    _party_prev = prev
+                    result = f"let's partyyy!|{name}"
+                except Exception:
+                    _safe_shuffle(sp, True)
+                    _party_prev = _shuffle_only(prev)
+                    result = "let's partyyy!"
         elif command == "favourite":
             # Save the currently playing track to Liked Songs
             track = sp.current_user_playing_track()
