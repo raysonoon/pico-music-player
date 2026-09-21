@@ -177,22 +177,31 @@ function:
 			Update all memory to OLED
 ********************************************************************************/
 void OLED_1in3_C_Display(const UBYTE *Image)
-{		
-    UWORD Width, Height, column, temp;
-    Width = (OLED_1in3_C_WIDTH % 8 == 0)? (OLED_1in3_C_WIDTH / 8 ): (OLED_1in3_C_WIDTH / 8 + 1);
-    Height = OLED_1in3_C_HEIGHT;   
-    OLED_WriteReg(0xb0); 	//Set the row  start address
+{
+    static UBYTE buf[OLED_1in3_C_WIDTH * OLED_1in3_C_HEIGHT / 8];  // reversed copy
+    UWORD Width = OLED_1in3_C_WIDTH / 8;
+    UWORD Height = OLED_1in3_C_HEIGHT;
+    for (UWORD n = 0; n < Width * Height; n++) {
+        buf[n] = reverse(Image[n]);
+    }
+
+    OLED_CS_0;  			// hold CS low for the whole frame
+
+    OLED_DC_0;
+    UBYTE page = 0xb0; 		//Set the row start address
+    DEV_SPI_WriteByte(page);
+
     for (UWORD j = 0; j < Height; j++) {
-        column = 63 - j;
-        OLED_WriteReg(0x00 + (column & 0x0f));  //Set column low start address
-        OLED_WriteReg(0x10 + (column >> 4));  //Set column higt start address
-        for (UWORD i = 0; i < Width; i++) {
-            temp = Image[i + j * Width];
-            // printf("0x%x \r\n",temp);
-            temp = reverse(temp);	//reverse the buffer
-            OLED_WriteData(temp);
-         }
-    }   
+        UWORD column = 63 - j;
+        UBYTE regs[2] = { (UBYTE)(0x00 + (column & 0x0f)),
+                          (UBYTE)(0x10 + (column >> 4)) };
+        OLED_DC_0;
+        DEV_SPI_Write_nByte(regs, 2);  			//Set column low/high start address
+        OLED_DC_1;
+        DEV_SPI_Write_nByte(&buf[j * Width], Width);
+    }
+
+    OLED_CS_1;
 }
 
 
