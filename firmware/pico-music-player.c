@@ -83,6 +83,9 @@
 #define HEART_OFFSET          26
 #define HEART_TIP             5
 
+// Connection-lost ellipsis animation
+#define LOST_ELLIPSIS_MS      600
+
 // Tap-count eyes layout
 #define EYE_Y                 24
 #define EYE_OFFSET            26
@@ -139,6 +142,8 @@ static UBYTE art_bmp[ART_BYTES];
 static http_state_t track_http;
 static bool track_req_pending = false;
 static bool connection_lost = false;
+static int lost_ellipsis_dots = 0;
+static absolute_time_t next_lost_frame = 0;
 
 typedef enum { MODE_NORMAL, MODE_FIND_SONG } app_mode_t;
 static app_mode_t app_mode = MODE_NORMAL;
@@ -228,6 +233,26 @@ static void oled_show_two_line(const char *line1, const char *line2) {
     if (strlen(line2) <= 18) paint_centered_clip(38, line2, &Font12, 18);
     else                     paint_centered_clip(38, line2, &Font8, 25);
     OLED_1in3_C_Display(oled_image);
+}
+
+static void render_connection_lost(void) {
+    Paint_Clear(BLACK);
+    paint_centered(26, "craving connection", &Font12);
+    char dots[4];
+    int n = lost_ellipsis_dots % 4;         // cycles "", ".", "..", "..."
+    for (int i = 0; i < n; i++) dots[i] = '.';
+    dots[n] = '\0';
+    paint_centered(36, dots, &Font12);
+    OLED_1in3_C_Display(oled_image);
+}
+
+static void show_connection_lost(void) {
+    if (!connection_lost) {
+        lost_ellipsis_dots = 0;
+        next_lost_frame = make_timeout_time_ms(LOST_ELLIPSIS_MS);
+    }
+    connection_lost = true;
+    render_connection_lost();
 }
 
 static void fmt_time(long ms, char *buf, size_t bufsz) {
@@ -738,8 +763,7 @@ static void render_art_screen(const char *label) {
 static void poll_track_start(void) {
     if (track_req_pending) return;
     if (!http_start(&track_http, "GET", "/track", 5000)) {
-        connection_lost = true;
-        oled_show_msg("craving connection");
+        show_connection_lost();
         return;
     }
     track_req_pending = true;
@@ -749,8 +773,7 @@ static void poll_track_finish(void) {
     if (!track_http.done) return;
     track_req_pending = false;
     if (!track_http.ok) {
-        connection_lost = true;
-        oled_show_msg("craving connection");
+        show_connection_lost();
         return;
     }
     connection_lost = false;
@@ -1061,6 +1084,12 @@ int main() {
         if (app_mode == MODE_FIND_SONG && find_window_active && time_reached(next_find_frame)) {
             next_find_frame = make_timeout_time_ms(FIND_RENDER_MS);
             draw_find_frame(NULL);
+        }
+
+        if (app_mode == MODE_NORMAL && connection_lost && time_reached(next_lost_frame)) {
+            next_lost_frame = make_timeout_time_ms(LOST_ELLIPSIS_MS);
+            lost_ellipsis_dots++;
+            render_connection_lost();
         }
 
         sleep_ms(10);
