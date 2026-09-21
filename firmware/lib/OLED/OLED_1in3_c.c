@@ -176,6 +176,16 @@ static UBYTE reverse(UBYTE temp)
 function:	
 			Update all memory to OLED
 ********************************************************************************/
+void OLED_1in3_C_DisplayOn(void)
+{
+    OLED_WriteReg(0xaf);
+}
+
+void OLED_1in3_C_DisplayOff(void)
+{
+    OLED_WriteReg(0xae);
+}
+
 void OLED_1in3_C_Display(const UBYTE *Image)
 {
     static UBYTE buf[OLED_1in3_C_WIDTH * OLED_1in3_C_HEIGHT / 8];  // reversed copy

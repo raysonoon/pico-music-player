@@ -86,6 +86,12 @@
 // Connection-lost ellipsis animation
 #define LOST_ELLIPSIS_MS      600
 
+// Sleep (host unreachable) behaviour
+#define SNOOZE_OFF_MS         5500   // show "snoozingg" this long, then screen off
+#define SNOOZE_Z_MS           700    // "z" -> "zz" -> "zzz" cycle
+#define SLEEP_POLL_MS         10000
+#define LOST_CONFIRM_MS       3000   // debounce before entering snooze after the bridge was seen
+
 // Tap-count eyes layout
 #define EYE_Y                 24
 #define EYE_OFFSET            26
@@ -144,6 +150,17 @@ static bool track_req_pending = false;
 static bool connection_lost = false;
 static int lost_ellipsis_dots = 0;
 static absolute_time_t next_lost_frame = 0;
+
+static bool sleeping = false;
+static bool snooze_visible = false;
+static int snooze_z = 0;
+static absolute_time_t next_snooze_frame = 0;
+static absolute_time_t snooze_off_at = 0;
+static bool wake_swallow = false;
+
+static bool bridge_seen = false;
+static bool lost_debounce = false;
+static absolute_time_t lost_since = 0;
 
 typedef enum { MODE_NORMAL, MODE_FIND_SONG } app_mode_t;
 static app_mode_t app_mode = MODE_NORMAL;
@@ -253,6 +270,43 @@ static void show_connection_lost(void) {
     }
     connection_lost = true;
     render_connection_lost();
+}
+
+static bool craving_connection(void) {
+    return connection_lost && !sleeping;
+}
+
+static void render_snooze(void) {
+    Paint_Clear(BLACK);
+    paint_centered(26, "snooozinggg", &Font12);
+    char z[5];
+    int n = snooze_z % 4;                 // cycles "", "z", "zz", "zzz"
+    for (int i = 0; i < n; i++) z[i] = 'z';
+    z[n] = '\0';
+    paint_centered(36, z, &Font12);
+    OLED_1in3_C_Display(oled_image);
+}
+
+static void start_snooze(void) {
+    snooze_visible = true;
+    snooze_z = 0;
+    next_snooze_frame = get_absolute_time();
+    snooze_off_at = make_timeout_time_ms(SNOOZE_OFF_MS);
+    render_snooze();
+}
+
+static void enter_sleep(void) {
+    if (sleeping) return;
+    sleeping = true;
+    connection_lost = true;
+    if (!snooze_visible) start_snooze();
+}
+
+static void wake_sleep(void) {
+    sleeping = false;
+    snooze_visible = false;
+    connection_lost = false;
+    OLED_1in3_C_DisplayOn();
 }
 
 static void fmt_time(long ms, char *buf, size_t bufsz) {
@@ -773,9 +827,23 @@ static void poll_track_finish(void) {
     if (!track_http.done) return;
     track_req_pending = false;
     if (!track_http.ok) {
-        show_connection_lost();
+        if (!bridge_seen) {
+            lost_debounce = false;
+            show_connection_lost();
+        } else {
+            if (!lost_debounce) {
+                lost_debounce = true;
+                lost_since = get_absolute_time();
+            }
+            if (time_reached(delayed_by_ms(lost_since, LOST_CONFIRM_MS))) {
+                enter_sleep();
+            }
+        }
         return;
     }
+    lost_debounce = false;
+    bridge_seen = true;
+    wake_sleep();
     connection_lost = false;
     static char body[HTTP_RESPONSE_MAX];
     http_extract_body(&track_http, body, sizeof(body));
@@ -1031,7 +1099,13 @@ int main() {
                 if (pressed) {
                     press_start = get_absolute_time();
                     long_press_fired = false;
-                } else if (!long_press_fired) {
+                    wake_swallow = sleeping;
+                    if (sleeping) {
+                        wake_sleep();
+                        start_snooze();
+                        next_poll = get_absolute_time();
+                    }
+                } else if (!long_press_fired && !wake_swallow && !craving_connection()) {
                     tap_count++;
                     multi_tap_deadline = make_timeout_time_ms(MULTI_TAP_WINDOW_MS);
                     render_eyes(tap_count);
@@ -1042,7 +1116,7 @@ int main() {
         }
 
         if (app_mode == MODE_NORMAL) {
-            if (button_pressed && !long_press_fired &&
+            if (button_pressed && !long_press_fired && !wake_swallow && !craving_connection() &&
                 absolute_time_diff_us(press_start, get_absolute_time()) >= LONG_PRESS_MS * 1000) {
                 long_press_fired = true;
                 tap_count = 0;
@@ -1058,8 +1132,8 @@ int main() {
         }
 
         if (app_mode == MODE_NORMAL && time_reached(next_poll)) {
-            int interval = POLL_DEFAULT_MS;
-            if (last_minimalist && !(last_remaining_ms > 0 && last_remaining_ms <= END_THRESHOLD_MS))
+            int interval = sleeping ? SLEEP_POLL_MS : POLL_DEFAULT_MS;
+            if (!sleeping && last_minimalist && !(last_remaining_ms > 0 && last_remaining_ms <= END_THRESHOLD_MS))
                 interval = POLL_IDLE_MS;
             next_poll = make_timeout_time_ms(interval);
             if (tap_count == 0 && time_reached(feedback_until) && !track_req_pending) {
@@ -1072,7 +1146,7 @@ int main() {
             poll_track_finish();
         }
 
-        if (app_mode == MODE_NORMAL && !connection_lost && g_have_snap && g_snap.duration_ms > 0 &&
+        if (app_mode == MODE_NORMAL && !snooze_visible && !connection_lost && g_have_snap && g_snap.duration_ms > 0 &&
             strcmp(g_snap.mode, "party") == 0 &&
             tap_count == 0 && time_reached(feedback_until) &&
             time_reached(next_party_frame)) {
@@ -1086,10 +1160,21 @@ int main() {
             draw_find_frame(NULL);
         }
 
-        if (app_mode == MODE_NORMAL && connection_lost && time_reached(next_lost_frame)) {
+        if (app_mode == MODE_NORMAL && connection_lost && !sleeping && time_reached(next_lost_frame)) {
             next_lost_frame = make_timeout_time_ms(LOST_ELLIPSIS_MS);
             lost_ellipsis_dots++;
             render_connection_lost();
+        }
+
+        if (snooze_visible && time_reached(next_snooze_frame)) {
+            next_snooze_frame = make_timeout_time_ms(SNOOZE_Z_MS);
+            snooze_z++;
+            render_snooze();
+        }
+
+        if (sleeping && snooze_visible && time_reached(snooze_off_at)) {
+            snooze_visible = false;
+            OLED_1in3_C_DisplayOff();
         }
 
         sleep_ms(10);

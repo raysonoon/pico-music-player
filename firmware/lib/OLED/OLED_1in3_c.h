@@ -59,6 +59,8 @@ function:
 void OLED_1in3_C_Init(void);
 void OLED_1in3_C_Clear(void);
 void OLED_1in3_C_Display(const UBYTE *Image);
+void OLED_1in3_C_DisplayOn(void);
+void OLED_1in3_C_DisplayOff(void);
 
 #endif  
 	 
