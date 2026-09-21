@@ -58,23 +58,25 @@
 #define ALBUM_BMP_BYTES       (BMP_ROW_BYTES * ALBUM_BUF_H)
 
 #define ICON_X                2
-#define ICON_Y                6
-#define TITLE_Y               3
-#define ARTIST_Y              16
+#define ICON_Y                8
+#define TITLE_Y               5
+#define ARTIST_Y              18
 #define ALBUM_Y               29
-#define BAR_Y                 41
+#define BAR_Y                 44
 #define BAR_H                 6
-#define TIME_Y                47
+#define BAR_X                 2    // inset so the bar stays clear of the party border
+#define BAR_W                 124  // 128 - 2 * BAR_X
+#define TIME_Y                52
 
 // Minimalist mode layout (must match the bridge rendering)
 #define MINI_TITLE_H          TITLE_BUF_H
 #define MINI_ARTIST_H         ARTIST_BUF_H
 #define MINI_ALBUM_H          ALBUM_BUF_H
 #define MINI_GLYPH_X          2
-#define MINI_GLYPH_Y          11
-#define MINI_TITLE_Y          5
-#define MINI_ARTIST_Y         25
-#define MINI_ALBUM_Y          40
+#define MINI_GLYPH_Y          13
+#define MINI_TITLE_Y          7
+#define MINI_ARTIST_Y         27
+#define MINI_ALBUM_Y          42
 
 // Heart (Favourite) animation layout
 #define HEART_CY              30
@@ -106,7 +108,7 @@
 typedef struct http_state {
     struct tcp_pcb *pcb;
     ip_addr_t remote_addr;
-    const char *request;
+    char request[256];
     size_t request_len;
     volatile bool done;
     volatile bool ok;
@@ -133,6 +135,10 @@ static track_snapshot_t g_snap;
 static bool g_have_snap = false;
 static float g_tempo_bpm = DEFAULT_BPM;
 static UBYTE art_bmp[ART_BYTES];
+
+static http_state_t track_http;
+static bool track_req_pending = false;
+static bool connection_lost = false;
 
 typedef enum { MODE_NORMAL, MODE_FIND_SONG } app_mode_t;
 static app_mode_t app_mode = MODE_NORMAL;
@@ -324,12 +330,12 @@ static void animate_love_face(void) {
 }
 
 static void draw_progress_bar(int y, int percent) {
-    Paint_DrawRectangle(0, y, 127, y + BAR_H - 1, WHITE, DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
+    Paint_DrawRectangle(BAR_X, y, BAR_X + BAR_W - 1, y + BAR_H - 1, WHITE, DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
     if (percent > 0) {
-        int fill = (percent * 126) / 100;
+        int fill = (percent * (BAR_W - 2)) / 100;
         if (fill < 1) fill = 1;
-        if (fill > 126) fill = 126;
-        Paint_DrawRectangle(1, y + 1, fill, y + BAR_H - 2, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+        if (fill > BAR_W - 2) fill = BAR_W - 2;
+        Paint_DrawRectangle(BAR_X + 1, y + 1, BAR_X + fill, y + BAR_H - 2, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
     }
 }
 
@@ -404,14 +410,12 @@ static err_t http_poll(void *arg, struct tcp_pcb *pcb) {
     return ERR_OK;
 }
 
-static bool http_request(const char *method, const char *path,
-                         char *body_out, size_t body_cap, uint32_t timeout_ms) {
-    static char request[256];
-    static http_state_t st;
-
+static bool http_start(http_state_t *s, const char *method, const char *path,
+                       uint32_t timeout_ms) {
+    memset(s, 0, sizeof(*s));
     int len;
     if (strcmp(method, "POST") == 0) {
-        len = snprintf(request, sizeof(request),
+        len = snprintf(s->request, sizeof(s->request),
                        "POST %s HTTP/1.1\r\n"
                        "Host: %s:%d\r\n"
                        "Content-Length: 0\r\n"
@@ -419,7 +423,7 @@ static bool http_request(const char *method, const char *path,
                        "\r\n",
                        path, BRIDGE_IP, BRIDGE_PORT);
     } else {
-        len = snprintf(request, sizeof(request),
+        len = snprintf(s->request, sizeof(s->request),
                        "GET %s HTTP/1.1\r\n"
                        "Host: %s:%d\r\n"
                        "Connection: close\r\n"
@@ -427,30 +431,50 @@ static bool http_request(const char *method, const char *path,
                        path, BRIDGE_IP, BRIDGE_PORT);
     }
 
-    memset(&st, 0, sizeof(st));
-    st.request = request;
-    st.request_len = (size_t)len;
-    st.deadline = make_timeout_time_ms(timeout_ms);
-    ip4addr_aton(BRIDGE_IP, &st.remote_addr);
+    s->request_len = (size_t)len;
+    s->deadline = make_timeout_time_ms(timeout_ms);
+    ip4addr_aton(BRIDGE_IP, &s->remote_addr);
 
-    st.pcb = tcp_new_ip_type(IP_GET_TYPE(&st.remote_addr));
-    if (!st.pcb) {
+    s->pcb = tcp_new_ip_type(IP_GET_TYPE(&s->remote_addr));
+    if (!s->pcb) {
         printf("error: no pcb\n");
         return false;
     }
 
-    tcp_arg(st.pcb, &st);
-    tcp_poll(st.pcb, http_poll, 1);
-    tcp_recv(st.pcb, http_recv);
-    tcp_err(st.pcb, http_err);
+    tcp_arg(s->pcb, s);
+    tcp_poll(s->pcb, http_poll, 1);
+    tcp_recv(s->pcb, http_recv);
+    tcp_err(s->pcb, http_err);
 
     cyw43_arch_lwip_begin();
-    err_t err = tcp_connect(st.pcb, &st.remote_addr, BRIDGE_PORT, http_connected);
+    err_t err = tcp_connect(s->pcb, &s->remote_addr, BRIDGE_PORT, http_connected);
     cyw43_arch_lwip_end();
     if (err != ERR_OK) {
         printf("error: connect\n");
         return false;
     }
+    return true;
+}
+
+static void http_extract_body(const http_state_t *s, char *out, size_t cap) {
+    const char *body = strstr(s->response, "\r\n\r\n");
+    out[0] = '\0';
+    if (body) {
+        body += 4;
+        size_t n = 0;
+        while (body[n] && n < cap - 1) {
+            out[n] = body[n];
+            n++;
+        }
+        out[n] = '\0';
+    }
+}
+
+static bool http_request(const char *method, const char *path,
+                         char *body_out, size_t body_cap, uint32_t timeout_ms) {
+    static http_state_t st;
+
+    if (!http_start(&st, method, path, timeout_ms)) return false;
 
     while (!st.done && !time_reached(st.deadline)) {
         sleep_ms(10);
@@ -462,17 +486,7 @@ static bool http_request(const char *method, const char *path,
     }
 
     if (body_out && body_cap > 0) {
-        const char *body = strstr(st.response, "\r\n\r\n");
-        body_out[0] = '\0';
-        if (body) {
-            body += 4;
-            size_t n = 0;
-            while (body[n] && n < body_cap - 1) {
-                body_out[n] = body[n];
-                n++;
-            }
-            body_out[n] = '\0';
-        }
+        http_extract_body(&st, body_out, body_cap);
     }
     return true;
 }
@@ -721,15 +735,29 @@ static void render_art_screen(const char *label) {
     OLED_1in3_C_Display(oled_image);
 }
 
-static void poll_track(void) {
-    static char body[HTTP_RESPONSE_MAX];
-
-    if (!http_request("GET", "/track", body, sizeof(body), 5000)) {
+static void poll_track_start(void) {
+    if (track_req_pending) return;
+    if (!http_start(&track_http, "GET", "/track", 5000)) {
+        connection_lost = true;
         oled_show_msg("craving connection");
         return;
     }
+    track_req_pending = true;
+}
+
+static void poll_track_finish(void) {
+    if (!track_http.done) return;
+    track_req_pending = false;
+    if (!track_http.ok) {
+        connection_lost = true;
+        oled_show_msg("craving connection");
+        return;
+    }
+    connection_lost = false;
+    static char body[HTTP_RESPONSE_MAX];
+    http_extract_body(&track_http, body, sizeof(body));
     if (!parse_track(body, &g_snap)) {
-        oled_show_text("Bad response", "");
+        oled_show_msg("toxic track");
         return;
     }
     g_have_snap = true;
@@ -1011,12 +1039,17 @@ int main() {
             if (last_minimalist && !(last_remaining_ms > 0 && last_remaining_ms <= END_THRESHOLD_MS))
                 interval = POLL_IDLE_MS;
             next_poll = make_timeout_time_ms(interval);
-            if (tap_count == 0 && time_reached(feedback_until)) {
-                poll_track();
+            if (tap_count == 0 && time_reached(feedback_until) && !track_req_pending) {
+                poll_track_start();
             }
         }
 
-        if (app_mode == MODE_NORMAL && g_have_snap && g_snap.duration_ms > 0 &&
+        if (track_req_pending && track_http.done &&
+            app_mode == MODE_NORMAL && tap_count == 0 && time_reached(feedback_until)) {
+            poll_track_finish();
+        }
+
+        if (app_mode == MODE_NORMAL && !connection_lost && g_have_snap && g_snap.duration_ms > 0 &&
             strcmp(g_snap.mode, "party") == 0 &&
             tap_count == 0 && time_reached(feedback_until) &&
             time_reached(next_party_frame)) {
