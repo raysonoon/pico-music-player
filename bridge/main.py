@@ -168,7 +168,7 @@ def _render_bitmaps(snap):
         else:
             snap["title_bmp"] = _render_line(snap["title"], TITLE_H, _font9, TITLE_X_OFFSET)
             snap["artist_bmp"] = _render_line(snap["artist"], ARTIST_H, _font9, 0)
-            snap["album_bmp"] = _render_line(snap["album"], ALBUM_H, _font8, 0)
+            snap["album_bmp"] = _render_line(snap["album"], ALBUM_H, _font9, 0)
     except Exception:
         snap["title_bmp"] = "00" * (FRAME_WIDTH * TITLE_H // 8)
         snap["artist_bmp"] = "00" * (FRAME_WIDTH * ARTIST_H // 8)
