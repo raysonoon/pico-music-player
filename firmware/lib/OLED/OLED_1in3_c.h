@@ -46,6 +46,10 @@ function:
 #define OLED_1in3_C_WIDTH  128//OLED width
 #define OLED_1in3_C_HEIGHT 64 //OLED height
 
+// Horizontal pixel shift applied at display time to dodge a left-edge hardware
+// defect. The visible logical x range becomes [0, 128 - OLED_H_SHIFT).
+#define OLED_H_SHIFT        8
+
 #define OLED_CS_0      DEV_Digital_Write(LCD_CS_PIN,0)
 #define OLED_CS_1      DEV_Digital_Write(LCD_CS_PIN,1)
 

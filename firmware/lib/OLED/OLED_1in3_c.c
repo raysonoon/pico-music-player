@@ -191,8 +191,13 @@ void OLED_1in3_C_Display(const UBYTE *Image)
     static UBYTE buf[OLED_1in3_C_WIDTH * OLED_1in3_C_HEIGHT / 8];  // reversed copy
     UWORD Width = OLED_1in3_C_WIDTH / 8;
     UWORD Height = OLED_1in3_C_HEIGHT;
-    for (UWORD n = 0; n < Width * Height; n++) {
-        buf[n] = reverse(Image[n]);
+    for (UWORD y = 0; y < Height; y++) {
+        UBYTE prev = 0;
+        for (UWORD x = 0; x < Width; x++) {
+            UBYTE cur = Image[y * Width + x];
+            buf[y * Width + x] = reverse((UBYTE)((cur >> OLED_H_SHIFT) | (prev << (8 - OLED_H_SHIFT))));
+            prev = cur & (UBYTE)((1u << OLED_H_SHIFT) - 1);
+        }
     }
 
     OLED_CS_0;  			// hold CS low for the whole frame

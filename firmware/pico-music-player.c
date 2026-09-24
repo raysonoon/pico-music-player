@@ -10,7 +10,7 @@
 #include "lwip/tcp.h"
 #include "lwip/ip4_addr.h"
 
-#include "network_config.h"
+#include "net_config.h"
 
 #include "OLED_1in3_c.h"
 #include "GUI_Paint.h"
@@ -65,7 +65,7 @@
 #define BAR_Y                 44
 #define BAR_H                 6
 #define BAR_X                 2    // inset so the bar stays clear of the party border
-#define BAR_W                 124  // 128 - 2 * BAR_X
+#define BAR_W                 (128 - OLED_H_SHIFT - 2 * BAR_X)
 #define TIME_Y                52
 
 // Minimalist mode layout (must match the bridge rendering)
@@ -113,6 +113,7 @@
 #define PARTY_BEATS_PER_LOOP  4
 #define PARTY_PULSE_FRAC      20
 #define BORDER_INSET          1
+#define BORDER_YOFF           4
 
 typedef struct http_state {
     struct tcp_pcb *pcb;
@@ -137,6 +138,8 @@ typedef struct {
     UBYTE artist_bmp[ARTIST_BMP_BYTES];
     UBYTE album_bmp[ALBUM_BMP_BYTES];
 } track_snapshot_t;
+
+static wifi_config_t g_cfg;
 
 static int last_remaining_ms = 0;
 static bool last_minimalist = false;
@@ -252,15 +255,28 @@ static void oled_show_two_line(const char *line1, const char *line2) {
     OLED_1in3_C_Display(oled_image);
 }
 
-static void render_connection_lost(void) {
+// Three-line centered "craving connection" screen; dots cycles "", ".", "..", "...".
+static void render_craving_connection(int dots) {
     Paint_Clear(BLACK);
-    paint_centered(26, "craving connection", &Font12);
-    char dots[4];
-    int n = lost_ellipsis_dots % 4;         // cycles "", ".", "..", "..."
-    for (int i = 0; i < n; i++) dots[i] = '.';
-    dots[n] = '\0';
-    paint_centered(36, dots, &Font12);
+    paint_centered(12, "craving", &Font12);
+    paint_centered(26, "connection", &Font12);
+    char buf[4];
+    int n = dots % 4;
+    for (int i = 0; i < n; i++) buf[i] = '.';
+    buf[n] = '\0';
+    paint_centered(40, buf, &Font12);
     OLED_1in3_C_Display(oled_image);
+}
+
+static void render_connection_lost(void) {
+    render_craving_connection(lost_ellipsis_dots);
+}
+
+// Idle animation used while USB setup mode is waiting for a host.
+static void setup_mode_display_tick(void) {
+    static int dots = 0;
+    dots = (dots + 1) % 4;
+    render_craving_connection(dots);
 }
 
 static void show_connection_lost(void) {
@@ -500,19 +516,19 @@ static bool http_start(http_state_t *s, const char *method, const char *path,
                        "Content-Length: 0\r\n"
                        "Connection: close\r\n"
                        "\r\n",
-                       path, BRIDGE_IP, BRIDGE_PORT);
+                       path, g_cfg.bridge_ip, g_cfg.bridge_port);
     } else {
         len = snprintf(s->request, sizeof(s->request),
                        "GET %s HTTP/1.1\r\n"
                        "Host: %s:%d\r\n"
                        "Connection: close\r\n"
                        "\r\n",
-                       path, BRIDGE_IP, BRIDGE_PORT);
+                       path, g_cfg.bridge_ip, g_cfg.bridge_port);
     }
 
     s->request_len = (size_t)len;
     s->deadline = make_timeout_time_ms(timeout_ms);
-    ip4addr_aton(BRIDGE_IP, &s->remote_addr);
+    ip4addr_aton(g_cfg.bridge_ip, &s->remote_addr);
 
     s->pcb = tcp_new_ip_type(IP_GET_TYPE(&s->remote_addr));
     if (!s->pcb) {
@@ -526,7 +542,7 @@ static bool http_start(http_state_t *s, const char *method, const char *path,
     tcp_err(s->pcb, http_err);
 
     cyw43_arch_lwip_begin();
-    err_t err = tcp_connect(s->pcb, &s->remote_addr, BRIDGE_PORT, http_connected);
+    err_t err = tcp_connect(s->pcb, &s->remote_addr, g_cfg.bridge_port, http_connected);
     cyw43_arch_lwip_end();
     if (err != ERR_OK) {
         printf("error: connect\n");
@@ -690,8 +706,9 @@ static bool parse_track(const char *body, track_snapshot_t *t) {
 }
 
 static void blit_bitmap(const UBYTE *bmp, int y0, int h) {
+    int vis_bytes = (128 - OLED_H_SHIFT) / 8;
     for (int r = 0; r < h; r++) {
-        for (int i = 0; i < BMP_ROW_BYTES; i++) {
+        for (int i = 0; i < vis_bytes; i++) {
             oled_image[(y0 + r) * BMP_ROW_BYTES + i] |= bmp[r * BMP_ROW_BYTES + i];
         }
     }
@@ -745,18 +762,18 @@ static void render_track(const track_snapshot_t *t) {
 }
 
 static void perimeter_point(int s, int *x, int *y) {
-    const int W = 128 - 2 * BORDER_INSET;
-    const int H = 64 - 2 * BORDER_INSET;
+    const int W = 128 - OLED_H_SHIFT - 2 * BORDER_INSET;
+    const int H = 64 - 2 * BORDER_INSET - BORDER_YOFF;
     int P = 2 * (W + H);
     s %= P;
     if (s < W) {
-        *x = BORDER_INSET + s; *y = BORDER_INSET;
+        *x = BORDER_INSET + s; *y = BORDER_INSET + BORDER_YOFF;
     } else if (s < W + H) {
-        *x = BORDER_INSET + W - 1; *y = BORDER_INSET + (s - W);
+        *x = BORDER_INSET + W - 1; *y = BORDER_INSET + BORDER_YOFF + (s - W);
     } else if (s < 2 * W + H) {
-        *x = BORDER_INSET + W - 1 - (s - W - H); *y = BORDER_INSET + H - 1;
+        *x = BORDER_INSET + W - 1 - (s - W - H); *y = BORDER_INSET + BORDER_YOFF + H - 1;
     } else {
-        *x = BORDER_INSET; *y = BORDER_INSET + H - 1 - (s - 2 * W - H);
+        *x = BORDER_INSET; *y = BORDER_INSET + BORDER_YOFF + H - 1 - (s - 2 * W - H);
     }
 }
 
@@ -775,7 +792,7 @@ static void draw_party_frame(int elapsed_ms) {
     draw_track_content(&g_snap, !on_beat);
 
     // Rotating bright segment, clockwise, one loop per bar; pulses on the beat.
-    const int P = 2 * ((128 - 2 * BORDER_INSET) + (64 - 2 * BORDER_INSET));
+    const int P = 2 * ((128 - OLED_H_SHIFT - 2 * BORDER_INSET) + (64 - 2 * BORDER_INSET - BORDER_YOFF));
     int head = (int)(((int64_t)(elapsed_ms % bar_ms) * P) / bar_ms % P);
     DOT_PIXEL seg_w = on_beat ? DOT_PIXEL_3X3 : DOT_PIXEL_1X1;
     for (int d = 0; d < PARTY_SEG_LEN; d++) {
@@ -944,7 +961,7 @@ static void enter_find_song_mode(void) {
     find_idle_deadline = make_timeout_time_ms(FIND_IDLE_MS);
     Paint_Clear(BLACK);
     paint_centered(8,  "feeling grumpy?", &Font12);
-    paint_centered(20, "let's find a song", &Font12);
+    paint_centered(20, "find a song tgt!", &Font12);
     paint_centered(44, "tap to start", &Font12);
     OLED_1in3_C_Display(oled_image);
 }
@@ -1060,6 +1077,21 @@ int main() {
     oled_init();
     oled_show_text("Pico", "Music Player");
 
+    gpio_init(BUTTON_PIN);
+    gpio_set_dir(BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(BUTTON_PIN);
+
+    // Load the WiFi/bridge config saved in flash. If it is missing, or the
+    // button is held while powering on, drop into USB-serial setup mode.
+    bool have_cfg = config_load(&g_cfg);
+    sleep_ms(50);
+    bool force_setup = !gpio_get(BUTTON_PIN);
+    if (!have_cfg || force_setup) {
+        setup_mode_display_tick();
+        config_setup_mode(&g_cfg, setup_mode_display_tick);  // saves config, falls through to connect
+        config_load(&g_cfg);
+    }
+
     if (cyw43_arch_init()) {
         printf("error: cyw43 init failed\n");
         return 1;
@@ -1067,16 +1099,14 @@ int main() {
 
     cyw43_arch_enable_sta_mode();
     printf("connecting to wifi...\n");
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
+    if (cyw43_arch_wifi_connect_timeout_ms(g_cfg.ssid, g_cfg.password,
                                            CYW43_AUTH_WPA2_AES_PSK, 30000)) {
         printf("warning: wifi connect failed, continuing without network\n");
+        printf("WIFI-FAIL\n");
     } else {
         printf("wifi connected\n");
+        printf("WIFI-OK\n");
     }
-
-    gpio_init(BUTTON_PIN);
-    gpio_set_dir(BUTTON_PIN, GPIO_IN);
-    gpio_pull_up(BUTTON_PIN);
 
     bool button_pressed = false;
     absolute_time_t debounce_until = 0;

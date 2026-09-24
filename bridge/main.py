@@ -71,6 +71,7 @@ BANDS = [
 
 # OLED text layout (must match the firmware constants)
 FRAME_WIDTH = 128
+OLED_H_SHIFT = 8
 TITLE_H = 13
 ARTIST_H = 13
 ALBUM_H = 12
@@ -147,7 +148,7 @@ def _render_line(text, height, font, x_offset=0):
     img = Image.new("1", (FRAME_WIDTH, height), 0)
     d = ImageDraw.Draw(img)
     t = text or ""
-    avail = FRAME_WIDTH - x_offset
+    avail = FRAME_WIDTH - OLED_H_SHIFT - x_offset
     if d.textlength(t, font=font) > avail:
         ell = "..."
         while t and d.textlength(t + ell, font=font) > avail:
