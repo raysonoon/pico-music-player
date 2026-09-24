@@ -5,4 +5,3 @@ PINOUT.md
 .env
 .cache
 __pycache__
-network_config.h

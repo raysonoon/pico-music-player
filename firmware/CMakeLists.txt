@@ -43,6 +43,7 @@ add_subdirectory(lib/Fonts)
 
 add_executable(pico-music-player
         pico-music-player.c
+        net_config.c
 )
 
 pico_set_program_name(pico-music-player "pico-music-player")
@@ -60,6 +61,8 @@ target_link_libraries(pico-music-player
         OLED
         GUI
         Fonts
+        hardware_flash
+        pico_flash
 )
 
 # Add the standard include files to the build

@@ -1,0 +1,54 @@
+HOW TO SET UP PICO MUSIC PLAYER
+===============================
+
+You only need to do this once. Setup takes a few minutes.
+
+WHAT YOU NEED
+-------------
+- A Windows computer
+- A Wi-Fi network that is 2.4 GHz (the Pico cannot see 5 GHz networks)
+- A Spotify Premium account (playing music requires Premium)
+
+STEP 1: PLUG IN THE PICO
+------------------------
+Use a USB cable to connect the Pico to your computer.
+If it was already plugged in, unplug it and plug it back in.
+
+STEP 2: PUT THE PICO INTO SETUP MODE
+------------------------------------
+- On first-time use, Pico boots in setup mode
+- To restart setup mode:
+  1. Unplug the Pico.
+  2. While the Pico is OFF, press and hold the button on the Pico.
+  3. Keep holding it and plug the USB cable back in.
+  4. Keep holding the button for about 2 seconds, then release.
+  5. Screen will show a message like "craving connection..."
+
+STEP 3: RUN setup.bat
+---------------------
+- Open the folder where this file is saved.
+- Double-click the file called:  setup.bat
+- A window will open. Follow the instructions it shows:
+    1. Type your Wi-Fi name (SSID) and press Enter.
+    2. Type your Wi-Fi password and press Enter.
+    3. If prompted for your computer's IP address, just press Enter to accept
+- Wait while it sets everything up. This can take a minute or two.
+
+STEP 4: LOG IN TO SPOTIFY
+-------------------------
+- When the setup finishes, your web browser will open.
+- Log in with your Spotify account.
+- A page will say you logged in successfully. You can close that tab.
+
+STEP 5: YOU'RE DONE!
+--------------------
+- The Pico will connect and start showing your music.
+- You can now use the buttons on the Pico to play, pause, skip, and more.
+
+TROUBLESHOOTING
+---------------
+- "No Wi-Fi found": make sure your Wi-Fi is 2.4 GHz, not 5 GHz.
+- "Can't log in": your Spotify account must be Premium, and the developer
+  must have added your account's email first.
+- Something goes wrong: just unplug the Pico, put it back in setup mode
+  (Step 2), and run setup.bat again.
